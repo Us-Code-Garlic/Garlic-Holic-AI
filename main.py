@@ -87,17 +87,15 @@ def calculate(expression: str) -> str:
 
 class GeminiChatService:
     def __init__(self):
-        self.llm = None
+        pass
     
     def get_llm(self, model_name: str = "gemini-2.0-flash", temperature: float = 0.7):
-        """LLM 인스턴스 생성 또는 반환"""
-        if self.llm is None or self.llm.model_name != model_name:
-            self.llm = ChatGoogleGenerativeAI(
-                model=model_name,
-                temperature=temperature,
-                google_api_key=GOOGLE_API_KEY
-            )
-        return self.llm
+        """LLM 인스턴스 생성"""
+        return ChatGoogleGenerativeAI(
+            model=model_name,
+            temperature=temperature,
+            google_api_key=GOOGLE_API_KEY
+        )
     
     def get_or_create_session(self, session_id: Optional[str] = None) -> str:
         """세션 생성 또는 기존 세션 반환"""

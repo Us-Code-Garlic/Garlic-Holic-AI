@@ -1,21 +1,23 @@
 import os
 import pyaudio
 import wave
-from openai import OpenAI
 from pathlib import Path
 from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
+from google.cloud import speech
 
 load_dotenv()
 
-# 1. OpenAI 클라이언트 초기화 (Whisper용)
+# 1. GCP Speech-to-Text 클라이언트 초기화
 try:
-    openai_client = OpenAI(
-        api_key=os.environ.get("OPENAI_API_KEY"),
-    )
-except TypeError:
-    print("OPENAI_API_KEY 환경 변수가 설정되지 않았습니다.")
-    print("`.env` 파일에 키를 추가하거나 환경 변수를 설정해주세요.")
+    speech_client = speech.SpeechClient()
+except Exception as e:
+    print("GCP Speech-to-Text 클라이언트 초기화에 실패했습니다.")
+    print("Google Cloud 인증이 설정되어 있는지 확인해주세요.")
+    print("다음 중 하나의 방법으로 인증을 설정하세요:")
+    print("1. GOOGLE_APPLICATION_CREDENTIALS 환경 변수 설정")
+    print("2. gcloud auth application-default login 실행")
+    print(f"오류: {e}")
     exit()
 
 # 2. Gemini 클라이언트 초기화
@@ -34,7 +36,7 @@ except Exception as e:
 # 3. 오디오 녹음 설정
 FORMAT = pyaudio.paInt16  # 16-bit 오디오 포맷
 CHANNELS = 1              # 모노 채널 (마이크는 보통 모노)
-RATE = 16000              # 샘플링 레이트 (Hz). Whisper가 선호하는 값입니다.
+RATE = 16000              # 샘플링 레이트 (Hz). GCP STT가 선호하는 값입니다.
 CHUNK = 1024              # 한 번에 읽을 프레임 크기
 RECORD_SECONDS = 5        # 녹음 시간 (초)
 WAVE_OUTPUT_FILENAME = Path(__file__).parent / "recorded_audio.wav"
@@ -79,21 +81,44 @@ def record_audio():
     print(f"오디오를 '{WAVE_OUTPUT_FILENAME}' 파일로 저장했습니다.")
     return WAVE_OUTPUT_FILENAME
 
-def transcribe_audio_with_whisper(audio_file_path):
-    """OpenAI Whisper API를 사용하여 오디오를 텍스트로 변환합니다."""
+def transcribe_audio_with_gcp(audio_file_path):
+    """GCP Speech-to-Text API를 사용하여 오디오를 텍스트로 변환합니다."""
     try:
+        # 오디오 파일 읽기
         with open(audio_file_path, "rb") as audio_file:
-            transcription = openai_client.audio.transcriptions.create(
-                model="whisper-1",
-                file=audio_file,
-                language="ko"
-            )
-            return transcription.text.strip()
+            content = audio_file.read()
+
+        # 오디오 설정
+        audio = speech.RecognitionAudio(content=content)
+        
+        # 인식 설정
+        config = speech.RecognitionConfig(
+            encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+            sample_rate_hertz=RATE,
+            language_code="ko-KR",  # 한국어 설정
+            enable_automatic_punctuation=True,  # 자동 문장부호 추가
+            model="latest_long"  # 긴 오디오에 최적화된 모델
+        )
+
+        # 음성 인식 요청
+        response = speech_client.recognize(config=config, audio=audio)
+
+        # 결과 처리
+        if response.results:
+            # 가장 신뢰도가 높은 결과 반환
+            transcript = ""
+            for result in response.results:
+                transcript += result.alternatives[0].transcript
+            return transcript.strip()
+        else:
+            print("음성을 인식할 수 없습니다.")
+            return None
+            
     except FileNotFoundError:
         print(f"오류: 녹음된 파일을 찾을 수 없습니다. ({audio_file_path})")
         return None
     except Exception as e:
-        print(f"Whisper API 호출 중 오류가 발생했습니다: {e}")
+        print(f"GCP Speech-to-Text API 호출 중 오류가 발생했습니다: {e}")
         return None
 
 def get_gemini_response(user_input):
@@ -107,9 +132,9 @@ def get_gemini_response(user_input):
         return "죄송합니다. 응답을 생성하는 중 오류가 발생했습니다."
 
 def main():
-    """메인 함수: 음성 녹음 -> Whisper STT -> Gemini 응답"""
+    """메인 함수: 음성 녹음 -> GCP STT -> Gemini 응답"""
     print("="*50)
-    print("음성 인식 + Gemini AI 챗봇")
+    print("음성 인식 + Gemini AI 챗봇 (GCP STT 사용)")
     print("5초간 음성을 입력하면 Gemini가 응답합니다.")
     print("="*50)
     
@@ -125,9 +150,9 @@ def main():
         if not audio_file:
             continue
         
-        # 2. Whisper로 텍스트 변환
+        # 2. GCP STT로 텍스트 변환
         print("음성을 텍스트로 변환 중...")
-        transcribed_text = transcribe_audio_with_whisper(audio_file)
+        transcribed_text = transcribe_audio_with_gcp(audio_file)
         
         if not transcribed_text:
             print("음성 인식에 실패했습니다. 다시 시도해주세요.")
