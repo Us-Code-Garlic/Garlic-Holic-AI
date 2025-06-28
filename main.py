@@ -1,373 +1,324 @@
-import os
-from typing import List, Optional, Dict, Any
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
-from langchain_core.tools import tool
-from pydantic import BaseModel as LangChainBaseModel
-from google.ai.generativelanguage_v1beta.types import Tool as GenAITool
+from pydantic import BaseModel
+from typing import Optional, List, TypedDict
+import os
 from dotenv import load_dotenv
-import uuid
-import asyncio
-from datetime import datetime
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+import google.generativeai as genai
+import google.genai as genai_client
+from google.genai import types
+from PIL import Image
+import json
+import random
 
 load_dotenv()
 
-# Google API 키 설정
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-
-# FastAPI 앱 초기화
-app = FastAPI(
-    title="Gemini AI Chat API",
-    description="LangChain과 Google Gemini를 활용한 AI 채팅 API",
-    version="1.0.0"
-)
+app = FastAPI(title="통합 API 서버", version="1.0.0")
 
 # CORS 설정
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 프로덕션에서는 특정 도메인으로 제한
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# 세션 관리 (실제 프로덕션에서는 Redis나 데이터베이스 사용 권장)
-chat_sessions = {}
+# ==================== 텍스트 요약 API 모델 ====================
 
-# Pydantic 모델들
-class ChatRequest(BaseModel):
-    message: str = Field(..., description="사용자 메시지")
-    session_id: Optional[str] = Field(None, description="세션 ID (없으면 새로 생성)")
-    model_name: Optional[str] = Field("gemini-2.0-flash", description="사용할 모델명")
-    temperature: Optional[float] = Field(0.7, description="창의성 조절 (0.0 ~ 1.0)")
+# 요청 모델
+class SummarizeRequest(BaseModel):
+    text: str
+    max_length: Optional[int] = 1000
+    chunk_size: Optional[int] = 2000
+    chunk_overlap: Optional[int] = 200
 
-class ChatResponse(BaseModel):
-    response: str = Field(..., description="AI 응답")
-    session_id: str = Field(..., description="세션 ID")
-    timestamp: datetime = Field(..., description="응답 시간")
+# 응답 모델
+class SummarizeResponse(BaseModel):
+    summary: str
+    original_length: int
+    summary_length: int
+    compression_ratio: float
+    success: bool
+    message: Optional[str] = None
 
-class StreamingChatRequest(BaseModel):
-    message: str = Field(..., description="사용자 메시지")
-    session_id: Optional[str] = Field(None, description="세션 ID")
+# ==================== 퀴즈 생성 API 모델 ====================
 
-class ToolCallRequest(BaseModel):
-    message: str = Field(..., description="사용자 메시지")
-    use_tools: bool = Field(True, description="도구 사용 여부")
+# 응답 모델
+class QuizResponse(BaseModel):
+    quiz: str
+    answer: str
+    commentary: str
+    success: bool
+    message: Optional[str] = None
+    image_path: Optional[str] = None
 
-class StructuredOutputRequest(BaseModel):
-    text: str = Field(..., description="구조화할 텍스트")
+# ==================== 텍스트 요약 함수들 ====================
 
-class Person(LangChainBaseModel):
-    """사람 정보를 구조화된 형태로 저장"""
-    name: str = Field(..., description="사람의 이름")
-    age: int = Field(..., description="나이")
-    occupation: str = Field(..., description="직업")
-
-class SessionInfo(BaseModel):
-    session_id: str
-    created_at: datetime
-    message_count: int
-    model_name: str
-
-# 도구(Tool) 정의
-@tool(description="사용자의 이름을 기억하고 인사하는 도구")
-def remember_name(name: str) -> str:
-    return f"안녕하세요 {name}님! 이름을 기억했습니다."
-
-@tool(description="간단한 계산을 수행하는 도구")
-def calculate(expression: str) -> str:
-    try:
-        result = eval(expression)
-        return f"계산 결과: {expression} = {result}"
-    except:
-        return "계산할 수 없는 표현식입니다."
-
-class GeminiChatService:
-    def __init__(self):
-        pass
+def split_text_into_chunks(text: str, chunk_size: int = 2000, chunk_overlap: int = 200) -> List[str]:
+    """
+    긴 텍스트를 청크로 분할합니다.
+    """
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        length_function=len,
+        separators=["\n\n", "\n", " ", ""]
+    )
     
-    def get_llm(self, model_name: str = "gemini-2.0-flash", temperature: float = 0.7):
-        """LLM 인스턴스 생성"""
-        return ChatGoogleGenerativeAI(
-            model=model_name,
-            temperature=temperature,
-            google_api_key=GOOGLE_API_KEY
-        )
+    return text_splitter.split_text(text)
+
+def map_reduce_summarize(text: str, model, max_length: Optional[int] = None) -> str:
+    """
+    Map-Reduce 방식을 사용하여 텍스트를 요약합니다.
+    """
+    # 텍스트를 청크로 분할
+    chunks = split_text_into_chunks(text)
     
-    def get_or_create_session(self, session_id: Optional[str] = None) -> str:
-        """세션 생성 또는 기존 세션 반환"""
-        if session_id and session_id in chat_sessions:
-            return session_id
+    if len(chunks) == 1:
+        # 단일 청크인 경우 직접 요약
+        prompt = f"""
+        당신은 전문적인 텍스트 요약 전문가입니다. 
+        주어진 텍스트를 한국어로 간결하고 정확하게 요약해주세요.
         
-        new_session_id = str(uuid.uuid4())
-        chat_sessions[new_session_id] = {
-            "conversation_history": [],
-            "created_at": datetime.now(),
-            "message_count": 0
-        }
-        return new_session_id
+        텍스트:
+        {text}
+        
+        요약:
+        """
+        response = model.generate_content(prompt)
+        summary = response.text
+    else:
+        # Map 단계: 각 청크를 개별적으로 요약
+        chunk_summaries = []
+        for chunk in chunks:
+            map_prompt = f"""
+            당신은 텍스트 요약 전문가입니다. 
+            주어진 텍스트 부분을 한국어로 간결하게 요약해주세요.
+            
+            텍스트 부분:
+            {chunk}
+            
+            요약:
+            """
+            response = model.generate_content(map_prompt)
+            chunk_summaries.append(response.text)
+        
+        # Reduce 단계: 모든 요약을 하나로 결합
+        combined_text = "\n\n".join(chunk_summaries)
+        reduce_prompt = f"""
+        당신은 텍스트 요약 전문가입니다. 
+        여러 개의 요약을 하나의 통합된 요약으로 만들어주세요. 
+        중복된 내용은 제거하고 핵심 내용만 포함해주세요.
+        
+        요약들:
+        {combined_text}
+        
+        통합된 요약:
+        """
+        response = model.generate_content(reduce_prompt)
+        summary = response.text
     
-    def add_to_history(self, session_id: str, user_message: str, ai_response: str):
-        """대화 기록에 메시지 추가"""
-        if session_id in chat_sessions:
-            chat_sessions[session_id]["conversation_history"].extend([
-                HumanMessage(content=user_message),
-                AIMessage(content=ai_response)
-            ])
-            chat_sessions[session_id]["message_count"] += 1
+    # 요약 길이 제한
+    if max_length and len(summary) > max_length:
+        short_prompt = f"""
+        당신은 텍스트 요약 전문가입니다. 
+        주어진 텍스트를 {max_length}자 이내로 한국어로 간결하게 요약해주세요.
+        
+        텍스트:
+        {summary}
+        
+        요약:
+        """
+        response = model.generate_content(short_prompt)
+        summary = response.text
+    
+    return summary
 
-# 서비스 인스턴스
-chat_service = GeminiChatService()
+# ==================== 퀴즈 생성 함수들 ====================
+
+def clean_json_response(response_text: str) -> str:
+    """
+    Gemini API 응답에서 JSON 부분을 추출하고 정리합니다.
+    """
+    # 코드 블록 제거
+    if "```json" in response_text:
+        # ```json과 ``` 사이의 내용 추출
+        start = response_text.find("```json") + 7
+        end = response_text.find("```", start)
+        if end != -1:
+            return response_text[start:end].strip()
+    
+    # 일반 JSON 형식인 경우
+    if response_text.strip().startswith("{") and response_text.strip().endswith("}"):
+        return response_text.strip()
+    
+    # JSON 부분 찾기
+    start = response_text.find("{")
+    end = response_text.rfind("}") + 1
+    if start != -1 and end != 0:
+        return response_text[start:end]
+    
+    return response_text
+
+def get_random_image_from_folder(folder_path: str = "example_img") -> tuple[str, Image.Image]:
+    """
+    example_img 폴더에서 임의의 이미지를 선택하여 반환합니다.
+    """
+    # 지원하는 이미지 확장자
+    image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.webp'}
+    
+    # 폴더 내 이미지 파일들 찾기
+    image_files = []
+    for filename in os.listdir(folder_path):
+        if any(filename.lower().endswith(ext) for ext in image_extensions):
+            image_files.append(filename)
+    
+    if not image_files:
+        raise FileNotFoundError(f"{folder_path} 폴더에 이미지 파일이 없습니다.")
+    
+    # 임의의 이미지 선택
+    selected_image = random.choice(image_files)
+    image_path = os.path.join(folder_path, selected_image)
+    
+    # 이미지 로드
+    image = Image.open(image_path)
+    
+    return selected_image, image
+
+# ==================== 공통 엔드포인트 ====================
 
 @app.get("/")
 async def root():
-    """API 루트 엔드포인트"""
     return {
-        "message": "Gemini AI Chat API",
+        "message": "통합 API 서버", 
         "version": "1.0.0",
-        "docs": "/docs"
+        "description": "텍스트 요약 및 치매예방 퀴즈 생성 API",
+        "endpoints": {
+            "POST /summarize": "텍스트 요약",
+            "GET /generate-quiz-random": "랜덤 이미지로 퀴즈 생성"
+        }
     }
-
-@app.post("/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest):
-    """기본 채팅 엔드포인트"""
-    try:
-        # 세션 관리
-        session_id = chat_service.get_or_create_session(request.session_id)
-        
-        # LLM 초기화
-        llm = chat_service.get_llm(request.model_name, request.temperature)
-        
-        # 대화 기록 가져오기
-        history = chat_sessions[session_id]["conversation_history"]
-        
-        # 메시지 생성
-        messages = history + [HumanMessage(content=request.message)]
-        
-        # AI 응답 생성
-        response = llm.invoke(messages)
-        
-        # 대화 기록 업데이트
-        chat_service.add_to_history(session_id, request.message, response.content)
-        
-        return ChatResponse(
-            response=response.content,
-            session_id=session_id,
-            timestamp=datetime.now()
-        )
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"채팅 처리 중 오류: {str(e)}")
-
-@app.post("/chat/stream")
-async def streaming_chat(request: StreamingChatRequest):
-    """스트리밍 채팅 엔드포인트"""
-    try:
-        session_id = chat_service.get_or_create_session(request.session_id)
-        llm = chat_service.get_llm()
-        
-        async def generate_stream():
-            try:
-                async for chunk in llm.astream(request.message):
-                    yield f"data: {chunk.content}\n\n"
-                yield "data: [DONE]\n\n"
-            except Exception as e:
-                yield f"data: 오류: {str(e)}\n\n"
-        
-        return generate_stream()
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"스트리밍 채팅 오류: {str(e)}")
-
-@app.post("/chat/tools")
-async def tool_calling_chat(request: ToolCallRequest):
-    """도구 호출 채팅 엔드포인트"""
-    try:
-        llm = chat_service.get_llm()
-        
-        if request.use_tools:
-            # 도구를 모델에 바인딩
-            llm_with_tools = llm.bind_tools([remember_name, calculate])
-            
-            # 도구 호출
-            ai_msg = llm_with_tools.invoke(request.message)
-            
-            # 도구 실행 결과 생성
-            tool_messages = []
-            for tool_call in ai_msg.tool_calls:
-                if tool_call["name"] == "remember_name":
-                    result = remember_name(tool_call["args"]["name"])
-                elif tool_call["name"] == "calculate":
-                    result = calculate(tool_call["args"]["expression"])
-                
-                tool_message = ToolMessage(
-                    content=result,
-                    tool_call_id=tool_call["id"]
-                )
-                tool_messages.append(tool_message)
-            
-            # 최종 응답 생성
-            final_response = llm_with_tools.invoke([ai_msg] + tool_messages)
-            
-            return {
-                "response": final_response.content,
-                "tool_calls": ai_msg.tool_calls,
-                "timestamp": datetime.now()
-            }
-        else:
-            # 일반 채팅
-            response = llm.invoke(request.message)
-            return {
-                "response": response.content,
-                "tool_calls": [],
-                "timestamp": datetime.now()
-            }
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"도구 호출 채팅 오류: {str(e)}")
-
-@app.post("/structured-output")
-async def structured_output(request: StructuredOutputRequest):
-    """구조화된 출력 엔드포인트"""
-    try:
-        llm = chat_service.get_llm(temperature=0)
-        structured_llm = llm.with_structured_output(Person)
-        
-        result = structured_llm.invoke(request.text)
-        
-        return {
-            "structured_data": {
-                "name": result.name,
-                "age": result.age,
-                "occupation": result.occupation
-            },
-            "timestamp": datetime.now()
-        }
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"구조화된 출력 오류: {str(e)}")
-
-@app.post("/google-search")
-async def google_search_chat(request: ChatRequest):
-    """Google 검색 통합 채팅"""
-    try:
-        llm = chat_service.get_llm()
-        
-        response = llm.invoke(
-            request.message,
-            tools=[GenAITool(google_search={})]
-        )
-        
-        return {
-            "response": response.content,
-            "timestamp": datetime.now()
-        }
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Google 검색 오류: {str(e)}")
-
-@app.post("/code-execution")
-async def code_execution_chat(request: ChatRequest):
-    """코드 실행 채팅"""
-    try:
-        llm = chat_service.get_llm()
-        
-        response = llm.invoke(
-            request.message,
-            tools=[GenAITool(code_execution={})]
-        )
-        
-        code_results = []
-        for content in response.content:
-            if isinstance(content, dict):
-                if content["type"] == "code_execution_result":
-                    code_results.append({
-                        "type": "execution_result",
-                        "result": content["code_execution_result"]
-                    })
-                elif content["type"] == "executable_code":
-                    code_results.append({
-                        "type": "executable_code",
-                        "code": content["executable_code"]
-                    })
-            else:
-                code_results.append({
-                    "type": "text",
-                    "content": str(content)
-                })
-        
-        return {
-            "response": response.content,
-            "code_results": code_results,
-            "timestamp": datetime.now()
-        }
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"코드 실행 오류: {str(e)}")
-
-@app.get("/sessions/{session_id}")
-async def get_session_info(session_id: str):
-    """세션 정보 조회"""
-    if session_id not in chat_sessions:
-        raise HTTPException(status_code=404, detail="세션을 찾을 수 없습니다")
-    
-    session = chat_sessions[session_id]
-    return SessionInfo(
-        session_id=session_id,
-        created_at=session["created_at"],
-        message_count=session["message_count"],
-        model_name="gemini-2.0-flash"
-    )
-
-@app.delete("/sessions/{session_id}")
-async def delete_session(session_id: str):
-    """세션 삭제"""
-    if session_id in chat_sessions:
-        del chat_sessions[session_id]
-        return {"message": "세션이 삭제되었습니다"}
-    else:
-        raise HTTPException(status_code=404, detail="세션을 찾을 수 없습니다")
-
-@app.get("/sessions")
-async def list_sessions():
-    """모든 세션 목록 조회"""
-    sessions = []
-    for session_id, session_data in chat_sessions.items():
-        sessions.append({
-            "session_id": session_id,
-            "created_at": session_data["created_at"],
-            "message_count": session_data["message_count"]
-        })
-    return {"sessions": sessions}
 
 @app.get("/health")
 async def health_check():
-    """헬스 체크 엔드포인트"""
-    return {
-        "status": "healthy",
-        "timestamp": datetime.now(),
-        "api_key_configured": bool(GOOGLE_API_KEY)
-    }
+    return {"status": "healthy", "message": "API 서버가 정상 작동 중입니다."}
+
+# ==================== 텍스트 요약 엔드포인트 ====================
+
+@app.post("/summarize", response_model=SummarizeResponse)
+async def summarize_text(request: SummarizeRequest):
+    """
+    Map-Reduce 방식을 사용하여 텍스트를 요약합니다.
+    """
+    try:
+        # Google API 키 확인
+        if not os.getenv("GOOGLE_API_KEY"):
+            raise HTTPException(
+                status_code=500, 
+                detail="GOOGLE_API_KEY가 설정되지 않았습니다."
+            )
+        
+        # 텍스트 길이 확인
+        if len(request.text.strip()) == 0:
+            raise HTTPException(
+                status_code=400, 
+                detail="텍스트가 비어있습니다."
+            )
+        
+        original_length = len(request.text)
+        
+        # Gemini 모델 초기화
+        genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        
+        # Map-Reduce 요약 실행
+        summary = map_reduce_summarize(request.text, model, request.max_length)
+        
+        summary_length = len(summary)
+        compression_ratio = (1 - summary_length / original_length) * 100 if original_length > 0 else 0
+        
+        return SummarizeResponse(
+            summary=summary,
+            original_length=original_length,
+            summary_length=summary_length,
+            compression_ratio=round(compression_ratio, 2),
+            success=True,
+            message=f"텍스트가 성공적으로 요약되었습니다. (압축률: {round(compression_ratio, 2)}%)"
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, 
+            detail=f"요약 중 오류가 발생했습니다: {str(e)}"
+        )
+
+# ==================== 퀴즈 생성 엔드포인트 ====================
+
+@app.get("/generate-quiz-random", response_model=QuizResponse)
+async def generate_quiz_random():
+    """
+    example_img 폴더에서 임의의 이미지를 선택하여 치매예방 퀴즈를 생성합니다.
+    """
+    try:
+        # 임의의 이미지 선택
+        selected_image_name, image = get_random_image_from_folder()
+        
+        # Gemini 클라이언트 초기화
+        client = genai_client.Client()
+        
+        # 치매예방 퀴즈 생성 요청
+        text_input = ('이 이미지를 참고해서 유사한 주제의 치매예방 퀴즈를 만들어 주세요. '
+                    '이미지와 완전히 똑같은 문제가 아니라, 이미지의 주제나 내용을 참고하여 '
+                    '비슷한 유형의 새로운 문제를 생성해 주세요. '
+                    '다음 JSON 형식으로 응답해 주세요: '
+                    '{"quiz": "질문", "answer": "답변", "commentary": "설명"}')
+        
+        # 이미지 분석용 모델 사용
+        response = client.models.generate_content(
+            model="gemini-1.5-pro",
+            contents=[text_input, image],
+            config=types.GenerateContentConfig(
+                response_modalities=['TEXT']
+            )
+        )
+        
+        # 응답 파싱
+        response_text = response.candidates[0].content.parts[0].text
+        
+        # JSON 파싱 및 검증
+        try:
+            # 응답 텍스트 정리
+            cleaned_response = clean_json_response(response_text)
+            quiz_data = json.loads(cleaned_response)
+            
+            return QuizResponse(
+                quiz=quiz_data['quiz'],
+                answer=quiz_data['answer'],
+                commentary=quiz_data['commentary'],
+                success=True,
+                message="퀴즈가 성공적으로 생성되었습니다.",
+                image_path=f"example_img/{selected_image_name}"
+            )
+            
+        except json.JSONDecodeError as e:
+            return QuizResponse(
+                quiz="",
+                answer="",
+                commentary=f"JSON 파싱 오류: {str(e)}\n원본 응답: {response_text}",
+                success=False,
+                message="JSON 파싱에 실패했습니다. 원본 응답을 확인하세요.",
+                image_path=f"example_img/{selected_image_name}"
+            )
+            
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"퀴즈 생성 중 오류가 발생했습니다: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
-    
-    if not GOOGLE_API_KEY:
-        print("오류: GOOGLE_API_KEY 환경변수가 설정되지 않았습니다.")
-        print("다음 명령어로 API 키를 설정해주세요:")
-        print("export GOOGLE_API_KEY='your-api-key-here'")
-        exit(1)
-    
-    print("=== Gemini AI Chat API 서버 시작 ===")
-    print("API 문서: http://localhost:8000/docs")
-    print("ReDoc 문서: http://localhost:8000/redoc")
-    
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=True
-    )
+    uvicorn.run(app, host="0.0.0.0", port=8000)
