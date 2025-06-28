@@ -11,6 +11,7 @@ from google.genai import types
 from PIL import Image
 import json
 import random
+import uvicorn
 
 load_dotenv()
 
@@ -388,5 +389,5 @@ async def generate_quiz_random():
         raise HTTPException(status_code=500, detail=f"퀴즈 생성 중 오류가 발생했습니다: {str(e)}")
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    
+    uvicorn.run(app, host="0.0.0.0", port=8001)

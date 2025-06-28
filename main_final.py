@@ -18,11 +18,6 @@ import numpy as np
 import soundfile as sf
 from datetime import datetime
 import librosa
-from sentence_transformers import SentenceTransformer
-from sklearn.metrics.pairwise import cosine_similarity
-import google.generativeai as genai
-import google.genai as genai_client
-from google.genai import types
 
 # 환경 변수 로드
 load_dotenv()
