@@ -1,3 +1,5 @@
-.env
+utils-api/.env
 ASR_Stroke_Dataset/
 extracted_audio_wav/
+.env
+agents-api/.env

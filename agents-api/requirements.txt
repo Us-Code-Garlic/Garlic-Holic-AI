@@ -1,0 +1,12 @@
+langchain-google-genai
+fastapi
+uvicorn
+langgraph
+python-dotenv
+sentence_transformers
+python-multipart
+librosa
+torchaudio
+langchain_community
+faiss-cpu
+pymysql

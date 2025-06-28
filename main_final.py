@@ -22,6 +22,18 @@ import librosa
 import pymysql
 from contextlib import contextmanager
 
+# FAISS 및 음성 분석 관련 import 추가
+from transformers import ClapModel, ClapProcessor
+import torchaudio
+import torch
+import torch.nn.functional as F
+from langchain_community.vectorstores import FAISS
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain.schema import Document
+from langchain_community.vectorstores.utils import DistanceStrategy
+from langchain.embeddings.base import Embeddings
+from tqdm import tqdm
+
 # 환경 변수 로드
 load_dotenv()
 
@@ -107,11 +119,41 @@ app.add_middleware(
 # LLM 초기화
 llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash")
 
-# 앱 시작 시 테이블 생성
+# CLAP 모델 및 FAISS 벡터스토어 전역 변수
+clap_model = None
+clap_processor = None
+faiss_vectorstore = None
+
+# 앱 시작 시 테이블 생성 및 모델 로드
 @app.on_event("startup")
 async def startup_event():
     """앱 시작 시 실행되는 이벤트"""
     create_chat_table()
+    await load_audio_models()
+
+async def load_audio_models():
+    """CLAP 모델과 FAISS 벡터스토어를 로드하는 함수"""
+    global clap_model, clap_processor, faiss_vectorstore
+    
+    try:
+        print("Loading CLAP model and processor...")
+        clap_model = ClapModel.from_pretrained("laion/clap-htsat-unfused")
+        clap_processor = ClapProcessor.from_pretrained("laion/clap-htsat-unfused")
+        
+        # FAISS 벡터스토어 로드
+        faiss_path = "./db/faiss"
+        if os.path.exists(faiss_path):
+            print("Loading FAISS vectorstore...")
+            faiss_vectorstore = load_faiss_vectorstore(faiss_path, clap_model, clap_processor)
+            if faiss_vectorstore:
+                print(f"FAISS vectorstore loaded with {faiss_vectorstore.index.ntotal} vectors")
+            else:
+                print("Failed to load FAISS vectorstore")
+        else:
+            print("FAISS vectorstore not found at", faiss_path)
+            
+    except Exception as e:
+        print(f"Error loading audio models: {e}")
 
 # ==================== Pydantic 모델 정의 ====================
 
@@ -156,6 +198,7 @@ class State(MessagesState):
     medicine_result: Optional[dict] = None
     mood_result: Optional[dict] = None
     health_result: Optional[dict] = None
+    stroke_result: Optional[dict] = None  # 추가: 뇌졸중 검사 결과
     user_id: Optional[str] = None  # 추가: 사용자 ID
 
 members = ["dementia_agent", "medicine_agent", "mood_health_agent"]
@@ -165,83 +208,166 @@ class Router(TypedDict):
     """Worker to route to next. If no workers needed, route to FINISH."""
     next: Literal[*options]
 
-# ==================== 음성 분석 함수들 ====================
+# ==================== FAISS 음성 분석 함수들 ====================
 
-def analyze_audio_pronunciation(audio_file_path: str):
-    """음성 파일을 분석하여 발음 어눌함을 검사하는 함수"""
+class AudioEmbeddings(Embeddings):
+    """오디오 임베딩을 위한 커스텀 클래스"""
+    def __init__(self, model, processor):
+        self.model = model
+        self.processor = processor
+    
+    def embed_documents(self, texts):
+        """문서 임베딩 (FAISS 호환성을 위해 구현)"""
+        embeddings = []
+        for text in tqdm(texts, desc="Embedding audio files", unit="file"):
+            try:
+                embed = load_and_embed_audio(text, self.model, self.processor)
+                if embed is not None:
+                    embed_np = embed.squeeze().cpu().numpy()
+                    embeddings.append(embed_np)
+                else:
+                    embeddings.append(np.zeros(512))
+            except Exception as e:
+                print(f"Error embedding {text}: {e}")
+                embeddings.append(np.zeros(512))
+        return embeddings
+    
+    def embed_query(self, text):
+        """쿼리 임베딩"""
+        try:
+            embed = load_and_embed_audio(text, self.model, self.processor)
+            if embed is not None:
+                embed_np = embed.squeeze().cpu().numpy()
+                return embed_np
+            else:
+                return np.zeros(512)
+        except Exception as e:
+            print(f"Error embedding query {text}: {e}")
+            return np.zeros(512)
+
+def load_and_embed_audio(file_path, model, processor):
+    """WAV 파일을 로드하고 임베딩을 추출하는 함수"""
     try:
-        # 음성 파일 로드
-        y, sr = librosa.load(audio_file_path, sr=None)
+        # WAV 파일 로드
+        waveform, sample_rate = torchaudio.load(file_path, normalize=True)
         
-        # 기본적인 음성 특성 분석
-        duration = float(len(y) / sr)
-        energy = float(np.mean(librosa.feature.rms(y=y)))
+        # 모노로 변환 (스테레오인 경우)
+        if waveform.shape[0] > 1:
+            waveform = torch.mean(waveform, dim=0, keepdim=True)
         
-        # 음성 스펙트럼 특성
-        mfccs = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
-        mfcc_mean = np.mean(mfccs, axis=1)
-        mfcc_std = np.std(mfccs, axis=1)
+        # CLAP 모델이 요구하는 48kHz로 리샘플링
+        target_sample_rate = 48000
+        if sample_rate != target_sample_rate:
+            resampler = torchaudio.transforms.Resample(
+                orig_freq=sample_rate, 
+                new_freq=target_sample_rate
+            )
+            waveform = resampler(waveform)
+            sample_rate = target_sample_rate
         
-        # 음성 명확도 (스펙트럼 중심)
-        spectral_centroids = librosa.feature.spectral_centroid(y=y, sr=sr)[0]
-        spectral_centroid_mean = float(np.mean(spectral_centroids))
+        # 오디오 배열을 numpy로 변환
+        audio_array = waveform.squeeze().numpy()
         
-        # 음성 대비 (스펙트럼 대비)
-        spectral_contrast = librosa.feature.spectral_contrast(y=y, sr=sr)
-        spectral_contrast_mean = float(np.mean(spectral_contrast))
+        # 프로세서를 사용하여 입력 준비
+        inputs = processor(audios=audio_array, sampling_rate=sample_rate, return_tensors="pt")
         
-        # 발음 어눌함 판단 기준
-        pronunciation_score = 0.0
-        details = []
+        # 오디오 임베딩 추출
+        with torch.no_grad():
+            audio_embed = model.get_audio_features(**inputs)
+            # 임베딩 벡터 정규화 (L2 norm)
+            audio_embed = F.normalize(audio_embed, p=2, dim=1)
         
-        # 음성 길이가 너무 짧으면 의심
-        if duration < 0.5:
-            pronunciation_score += 0.3
-            details.append("음성 길이가 너무 짧음")
+        return audio_embed
+    
+    except Exception as e:
+        print(f"Error processing {file_path}: {e}")
+        return None
+
+def load_faiss_vectorstore(save_path="./db/faiss", model=None, processor=None):
+    """로컬에서 FAISS 벡터스토어 로드"""
+    try:
+        if not os.path.exists(save_path):
+            print(f"Vectorstore path {save_path} does not exist")
+            return None
         
-        # 에너지가 너무 낮으면 의심
-        if energy < 0.01:
-            pronunciation_score += 0.2
-            details.append("음성 에너지가 낮음")
+        if model is None or processor is None:
+            print("Model and processor are required to load vectorstore")
+            return None
         
-        # 스펙트럼 중심이 너무 낮으면 의심
-        if spectral_centroid_mean < 1000:
-            pronunciation_score += 0.2
-            details.append("스펙트럼 중심 주파수가 낮음")
-        
-        # 스펙트럼 대비가 낮으면 의심
-        if spectral_contrast_mean < 10:
-            pronunciation_score += 0.3
-            details.append("스펙트럼 대비가 낮음")
-        
-        # 결과 결정
-        if pronunciation_score >= 0.5:
-            result = "unclear"
-            confidence = float(min(pronunciation_score, 0.9))
-        else:
-            result = "clear"
-            confidence = float(1.0 - pronunciation_score)
-        
-        return {
-            "type": "audio_pronunciation_analysis",
-            "result": result,
-            "confidence": confidence,
-            "details": details,
-            "audio_features": {
-                "duration": duration,
-                "energy": energy,
-                "spectral_centroid": spectral_centroid_mean,
-                "spectral_contrast": spectral_contrast_mean
-            }
-        }
+        audio_embeddings = AudioEmbeddings(model, processor)
+        vectorstore = FAISS.load_local(save_path, audio_embeddings, allow_dangerous_deserialization=True)
+        print(f"Vectorstore loaded from {save_path}")
+        return vectorstore
         
     except Exception as e:
+        print(f"Error loading vectorstore: {e}")
+        return None
+
+def check_stroke_with_faiss(audio_file_path: str):
+    """FAISS 벡터DB를 사용한 뇌졸중 검사 함수"""
+    global faiss_vectorstore, clap_model, clap_processor
+    
+    if faiss_vectorstore is None or clap_model is None or clap_processor is None:
         return {
-            "type": "audio_pronunciation_analysis",
+            "type": "stroke_check",
             "result": "error",
             "confidence": 0.0,
-            "details": f"음성 분석 오류: {str(e)}",
-            "audio_features": {}
+            "details": "FAISS 벡터스토어 또는 CLAP 모델이 로드되지 않음",
+            "similar_count": 0
+        }
+    
+    if not os.path.exists(audio_file_path):
+        return {
+            "type": "stroke_check",
+            "result": "error",
+            "confidence": 0.0,
+            "details": "음성 파일이 존재하지 않음",
+            "similar_count": 0
+        }
+    
+    try:
+        print(f"Checking stroke with FAISS for {audio_file_path}")
+        
+        # 쿼리 임베딩 생성
+        query_embedding = faiss_vectorstore.embedding_function.embed_query(audio_file_path)
+        
+        # FAISS 인덱스에서 모든 결과 검색
+        query_embedding_reshaped = np.array([query_embedding], dtype=np.float32)
+        distances, indices = faiss_vectorstore.index.search(query_embedding_reshaped, faiss_vectorstore.index.ntotal)
+        
+        # 유사도 점수 계산 (코사인 유사도)
+        similarities = 1 - distances[0]
+        
+        # 0.5 이상 유사한 음성 개수 계산
+        similar_count = sum(1 for sim in similarities if sim >= 0.5)
+        
+        # 뇌졸중 판단: 100개 이상이면 뇌졸중 의심
+        stroke_suspicion = similar_count >= 100
+        
+        # 신뢰도 계산 (유사한 음성 비율 기반)
+        confidence = min(similar_count / 100.0, 1.0) if stroke_suspicion else 0.0
+        
+        result = {
+            "type": "stroke_check",
+            "result": "stroke_suspicion" if stroke_suspicion else "normal",
+            "confidence": float(confidence),
+            "details": f"유사한 음성 {similar_count}개 발견 (임계값: 100개)",
+            "similar_count": similar_count,
+            "total_vectors": len(similarities),
+            "similarity_scores": similarities.tolist()[:10]  # 상위 10개 점수만
+        }
+        
+        print(f"Stroke check result: {result}")
+        return result
+        
+    except Exception as e:
+        print(f"Error in stroke check: {e}")
+        return {
+            "type": "stroke_check",
+            "result": "error",
+            "confidence": 0.0,
+            "details": f"뇌졸중 검사 오류: {str(e)}",
+            "similar_count": 0
         }
 
 # ==================== 치매 검사 함수들 ====================
@@ -312,159 +438,8 @@ def process_conversation(patient_id: str, conversation_text: str):
             }]
         }
 
-def check_pronunciation_clarity(conversation_text: str, audio_file_path: Optional[str] = None):
-    """발음이 어눌한지 검사하는 함수 (텍스트 + 음성 파일)"""
-    results = []
-    
-    # 1. 텍스트 기반 발음 분석
-    pronunciation_prompt = f"""
-    다음 환자의 대화 내용에서 발음이나 언어 표현의 어눌함을 분석해주세요:
-    
-    대화: "{conversation_text}"
-    
-    분석 기준:
-    - 문장이 중간에 끊어지는 경우
-    - 단어를 찾지 못하는 경우
-    - 발음이 어려운 단어를 피하는 경우
-    - 문법적으로 어색한 표현
-    
-    응답 형식:
-    - 발음 상태: [clear/unclear]
-    - 신뢰도: [0.0-1.0]
-    - 분석 내용: [구체적인 관찰 내용]
-    """
-    
-    try:
-        response = llm.invoke(pronunciation_prompt)
-        response_text = response.content
-        
-        lines = response_text.split('\n')
-        pronunciation_status = "clear"
-        confidence = 0.5
-        details = ""
-        
-        for line in lines:
-            if "발음 상태:" in line:
-                status = line.split("발음 상태:")[1].strip().lower()
-                if "unclear" in status:
-                    pronunciation_status = "unclear"
-            elif "신뢰도:" in line:
-                try:
-                    conf = line.split("신뢰도:")[1].strip()
-                    confidence = float(conf)
-                except:
-                    pass
-            elif "분석 내용:" in line:
-                details = line.split("분석 내용:")[1].strip()
-        
-        results.append({
-            "type": "text_pronunciation_analysis",
-            "result": pronunciation_status,
-            "confidence": float(confidence),
-            "details": details
-        })
-        
-    except Exception as e:
-        results.append({
-            "type": "text_pronunciation_analysis",
-            "result": "error",
-            "confidence": 0.0,
-            "details": f"텍스트 발음 분석 오류: {str(e)}"
-        })
-    
-    # 2. 음성 파일 기반 발음 분석 (있는 경우)
-    if audio_file_path and os.path.exists(audio_file_path):
-        audio_result = analyze_audio_pronunciation(audio_file_path)
-        results.append(audio_result)
-    
-    # 3. 결과 통합
-    if len(results) == 2:  # 텍스트 + 음성 모두 있는 경우
-        text_result = results[0]
-        audio_result = results[1]
-        
-        # 두 결과를 가중 평균으로 통합
-        text_weight = 0.4
-        audio_weight = 0.6
-        
-        combined_confidence = float(text_result["confidence"] * text_weight + 
-                                   audio_result["confidence"] * audio_weight)
-        
-        # 둘 중 하나라도 unclear이면 unclear로 판정
-        if text_result["result"] == "unclear" or audio_result["result"] == "unclear":
-            final_result = "unclear"
-        else:
-            final_result = "clear"
-        
-        return {
-            "type": "pronunciation_clarity",
-            "result": final_result,
-            "confidence": combined_confidence,
-            "details": f"텍스트 분석: {text_result['result']}, 음성 분석: {audio_result['result']}",
-            "sub_analyses": results
-        }
-    
-    else:  # 텍스트만 있는 경우
-        return results[0]
-
-def check_memory_recall(conversation_text: str):
-    """기억력 검사 함수"""
-    memory_prompt = f"""
-    다음 환자의 대화 내용에서 기억력 문제를 분석해주세요:
-    
-    대화: "{conversation_text}"
-    
-    분석 기준:
-    - 최근 일에 대한 기억 부족
-    - 시간 개념의 혼란
-    - 반복적인 질문
-    - 과거 일에 대한 막연한 표현
-    
-    응답 형식:
-    - 기억력 상태: [normal/impaired]
-    - 신뢰도: [0.0-1.0]
-    - 분석 내용: [구체적인 관찰 내용]
-    """
-    
-    try:
-        response = llm.invoke(memory_prompt)
-        response_text = response.content
-        
-        lines = response_text.split('\n')
-        memory_status = "normal"
-        confidence = 0.5
-        details = ""
-        
-        for line in lines:
-            if "기억력 상태:" in line:
-                status = line.split("기억력 상태:")[1].strip().lower()
-                if "impaired" in status:
-                    memory_status = "impaired"
-            elif "신뢰도:" in line:
-                try:
-                    conf = line.split("신뢰도:")[1].strip()
-                    confidence = float(conf)
-                except:
-                    pass
-            elif "분석 내용:" in line:
-                details = line.split("분석 내용:")[1].strip()
-        
-        return {
-            "type": "memory_recall",
-            "result": memory_status,
-            "confidence": confidence,
-            "details": details
-        }
-        
-    except Exception as e:
-        return {
-            "type": "memory_recall",
-            "result": "error",
-            "confidence": 0.0,
-            "details": f"기억력 검사 오류: {str(e)}"
-        }
-
 def check_repetitive_speech(conversation_text: str):
-    """반복 발화 검사 함수"""
+    """반복 발화 검사 함수 - 치매 판단용"""
     repetition_prompt = f"""
     다음 환자의 대화 내용에서 반복적인 발화 패턴을 분석해주세요:
     
@@ -518,6 +493,64 @@ def check_repetitive_speech(conversation_text: str):
             "result": "error",
             "confidence": 0.0,
             "details": f"반복 발화 검사 오류: {str(e)}"
+        }
+
+def check_memory_recall(conversation_text: str):
+    """기억력 검사 함수 - 치매 판단용"""
+    memory_prompt = f"""
+    다음 환자의 대화 내용에서 기억력 문제를 분석해주세요:
+    
+    대화: "{conversation_text}"
+    
+    분석 기준:
+    - 최근 일에 대한 기억 부족
+    - 시간 개념의 혼란
+    - 반복적인 질문
+    - 과거 일에 대한 막연한 표현
+    - 이전 대화 내용 참조 능력
+    
+    응답 형식:
+    - 기억력 상태: [normal/impaired]
+    - 신뢰도: [0.0-1.0]
+    - 분석 내용: [구체적인 관찰 내용]
+    """
+    
+    try:
+        response = llm.invoke(memory_prompt)
+        response_text = response.content
+        
+        lines = response_text.split('\n')
+        memory_status = "normal"
+        confidence = 0.5
+        details = ""
+        
+        for line in lines:
+            if "기억력 상태:" in line:
+                status = line.split("기억력 상태:")[1].strip().lower()
+                if "impaired" in status:
+                    memory_status = "impaired"
+            elif "신뢰도:" in line:
+                try:
+                    conf = line.split("신뢰도:")[1].strip()
+                    confidence = float(conf)
+                except:
+                    pass
+            elif "분석 내용:" in line:
+                details = line.split("분석 내용:")[1].strip()
+        
+        return {
+            "type": "memory_recall",
+            "result": memory_status,
+            "confidence": confidence,
+            "details": details
+        }
+        
+    except Exception as e:
+        return {
+            "type": "memory_recall",
+            "result": "error",
+            "confidence": 0.0,
+            "details": f"기억력 검사 오류: {str(e)}"
         }
 
 # ==================== 복약 분석 함수들 ====================
@@ -734,39 +767,43 @@ def dementia_node(state: State) -> Command[Literal["__end__"]]:
         # 대화 처리
         conversation_result = process_conversation(patient_id, conversation_text)
         
-        # 추가 검사들 (음성 파일 경로 전달)
-        pronunciation_result = check_pronunciation_clarity(conversation_text, audio_file_path)
-        memory_result = check_memory_recall(conversation_text)
+        # 뇌졸중 검사 (음성 파일이 있는 경우)
+        stroke_result = None
+        if audio_file_path and os.path.exists(audio_file_path):
+            stroke_result = check_stroke_with_faiss(audio_file_path)
+            print(f"뇌졸중 검사 결과: {stroke_result}")
+        
+        # 치매 검사: 반복 발화 + 기억력 검사
         repetition_result = check_repetitive_speech(conversation_text)
+        memory_result = check_memory_recall(conversation_text)
         
         # 결과 통합
         check_results = [
             conversation_result["check_results"][0],
-            pronunciation_result,
-            memory_result,
-            repetition_result
+            repetition_result,
+            memory_result
         ]
         
-        # 최종 진단 결정
-        dementia_indicators = 0
-        total_confidence = 0.0
+        # 뇌졸중 검사 결과 추가
+        if stroke_result:
+            check_results.append(stroke_result)
         
-        for result in check_results:
-            if result["type"] == "conversation_analysis" and result["result"] == "yes":
-                dementia_indicators += 1
-            elif result["type"] == "pronunciation_clarity" and result["result"] == "unclear":
-                dementia_indicators += 1
-            elif result["type"] == "memory_recall" and result["result"] == "impaired":
-                dementia_indicators += 1
-            elif result["type"] == "repetitive_speech" and result["result"] == "repetitive":
-                dementia_indicators += 1
-            
-            total_confidence += float(result.get("confidence", 0))
+        # 치매 판단: 반복 발화 + 기억력 검사 둘 다 0.5점 이상이면 치매 의심
+        repetition_score = float(repetition_result.get("confidence", 0)) if repetition_result.get("result") == "repetitive" else 0.0
+        memory_score = float(memory_result.get("confidence", 0)) if memory_result.get("result") == "impaired" else 0.0
+        
+        dementia_indicators = 0
+        if repetition_score >= 0.5:
+            dementia_indicators += 1
+        if memory_score >= 0.5:
+            dementia_indicators += 1
         
         final_diagnosis = "yes" if dementia_indicators >= 2 else "no"
-        avg_confidence = float(total_confidence / len(check_results)) if check_results else 0.0
+        avg_confidence = float((repetition_score + memory_score) / 2) if (repetition_score + memory_score) > 0 else 0.0
         
-        print(f"치매 의심 지표: {dementia_indicators}/4")
+        print(f"치매 의심 지표: {dementia_indicators}/2")
+        print(f"반복 발화 점수: {repetition_score:.3f}")
+        print(f"기억력 점수: {memory_score:.3f}")
         print(f"평균 신뢰도: {avg_confidence:.3f}")
         print(f"최종 진단: {final_diagnosis}")
         
@@ -775,7 +812,9 @@ def dementia_node(state: State) -> Command[Literal["__end__"]]:
             "confidence": avg_confidence,
             "contents": conversation_result["contents"],
             "check_results": check_results,
-            "summary": f"치매 의심 지표 수: {dementia_indicators}/4, 평균 신뢰도: {avg_confidence:.3f}",
+            "summary": f"치매 의심 지표 수: {dementia_indicators}/2, 평균 신뢰도: {avg_confidence:.3f}",
+            "repetition_score": repetition_score,
+            "memory_score": memory_score,
             "audio_used": audio_file_path is not None
         }
         
@@ -793,7 +832,8 @@ def dementia_node(state: State) -> Command[Literal["__end__"]]:
                         name="dementia_agent"
                     )
                 ],
-                "dementia_result": dementia_result
+                "dementia_result": dementia_result,
+                "stroke_result": stroke_result  # 뇌졸중 검사 결과 추가
             },
             goto="__end__"  # 실행 후 바로 종료
         )
@@ -1104,6 +1144,7 @@ async def supervisor_endpoint(
             "medicine_result": response.get("medicine_result"),
             "mood_result": response.get("mood_result"),
             "health_result": response.get("health_result"),
+            "stroke_result": response.get("stroke_result"),  # 뇌졸중 검사 결과 추가
             "messages": [msg.dict() if hasattr(msg, 'dict') else msg for msg in response.get("messages", [])]
         }
         
@@ -1193,6 +1234,7 @@ async def supervisor_json_endpoint(request: SupervisorRequest):
             "medicine_result": response.get("medicine_result"),
             "mood_result": response.get("mood_result"),
             "health_result": response.get("health_result"),
+            "stroke_result": response.get("stroke_result"),  # 뇌졸중 검사 결과 추가
             "messages": [msg.dict() if hasattr(msg, 'dict') else msg for msg in response.get("messages", [])]
         }
         
@@ -1266,6 +1308,12 @@ if __name__ == "__main__":
     print("- POST /supervisor: Supervisor Agent (음성 파일 지원)")
     print("- POST /supervisor-json: Supervisor Agent (JSON 형식)")
     print("- GET /health: 헬스 체크")
+    print()
+    
+    print("=== 새로운 기능 ===")
+    print("- FAISS 벡터DB를 사용한 뇌졸중 검사")
+    print("- 개선된 치매 검사 (반복 발화 + 기억력 검사)")
+    print("- 음성 파일 임베딩 기반 유사도 분석")
     print()
     
     print("=== 서버 시작 ===")
