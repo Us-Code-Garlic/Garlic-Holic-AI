@@ -50,7 +50,9 @@ class SupervisorRequest(BaseModel):
 
 class SupervisorResponse(BaseModel):
     service_type: str = Field(..., description="서비스 타입 (dementia/medicine/mood_health)")
-    response: dict = Field(..., description="응답 내용")
+    selected_agent: str = Field(..., description="선택된 Agent")
+    state: dict = Field(..., description="전체 State 정보")
+    response: dict = Field(..., description="주요 응답 내용")
     next_action: str = Field(..., description="다음 액션")
 
 # 복약 관련 모델
@@ -75,6 +77,8 @@ class State(MessagesState):
     service_type: Optional[str] = None
     patient_id: Optional[str] = None
     audio_file_path: Optional[str] = None
+    selected_agent: Optional[str] = None
+    executed_agents: list = []  # 추가: 실행된 Agent 목록
     dementia_result: Optional[dict] = None
     medicine_result: Optional[dict] = None
     mood_result: Optional[dict] = None
@@ -568,55 +572,84 @@ def generate_mood_health_response(mood_health_info: MoodHealthInfo):
 
 # ==================== LangGraph 노드들 ====================
 
-# Supervisor 노드
-system_prompt = f"""
-당신은 의료 서비스를 관리하는 Supervisor Agent입니다.
-다음 세 가지 서비스를 관리합니다:
-
-1. dementia_agent: 치매 검사 서비스
-   - 환자의 대화나 음성을 분석하여 치매 의심 여부를 검사
-   - 발음 어눌함, 기억력 저하, 반복 발화 등을 분석
-   - 사용 예시: "아침에 약을 먹었는데 또 먹어야 하나요?", "오늘 날짜가 뭐였지?"
-
-2. medicine_agent: 복약 알림 서비스
-   - 복약 관련 메시지를 분석하여 복용 시간, 약물명, 복용량 추출
-   - 복약 알림 설정 및 관리
-   - 사용 예시: "아침 8시에 혈압약 1정 먹어야 해", "관절염 약 2개씩 복용"
-
-3. mood_health_agent: 기분 및 건강체크 서비스
-   - 환자의 기분 상태를 "좋음", "나쁨", "평범" 중 하나로 판별
-   - 전반적인 건강 상태를 텍스트로 분석
-   - 사용 예시: "오늘 기분이 좋아요", "몸이 좀 아파요", "컨디션이 평범해요"
-
-사용자의 메시지를 분석하여 적절한 서비스로 라우팅하세요:
-- 치매 관련 증상이나 인지 기능 문제 → dementia_agent
-- 복약 관련 정보나 알림 설정 → medicine_agent
-- 기분이나 건강 상태 관련 → mood_health_agent
-- 두 서비스 이상 필요하거나 명확하지 않으면 → mood_health_agent (일반적인 대화 우선)
-
-작업이 완료되면 FINISH로 응답하세요.
-"""
-
+# Supervisor 노드 - 단순한 키워드 기반 라우팅 - 1개 Agent만 실행 후 종료
 def supervisor_node(state: State) -> Command[Literal[*members, "__end__"]]:
-    messages = [
-        {"role": "system", "content": system_prompt},
-    ] + state["messages"]
+    """단순한 키워드 기반 라우팅 - 1개 Agent만 실행 후 종료"""
+    message = state["messages"][-1].content.lower()
     
-    response = llm.with_structured_output(Router).invoke(messages)
-    goto = response["next"]
+    print(f"\n=== SUPERVISOR NODE ===")
+    print(f"입력 메시지: {message}")
     
-    if goto == "FINISH":
-        goto = END
+    # 복약 관련 키워드 체크 (최우선)
+    medicine_keywords = [
+        "약", "복용", "복약", "정", "개", "ml", "시간", 
+        "아침", "저녁", "점심", "8시", "9시", "10시", "11시", "12시",
+        "1시", "2시", "3시", "4시", "5시", "6시", "7시"
+    ]
+    if any(keyword in message for keyword in medicine_keywords):
+        matched_keywords = [kw for kw in medicine_keywords if kw in message]
+        print(f"복약 키워드 매칭: {matched_keywords}")
+        print(f"라우팅: medicine_agent")
+        return Command(
+            goto="medicine_agent", 
+            update={
+                "selected_agent": "medicine_agent",
+                "service_type": "medicine"
+            }
+        )
     
-    return Command(goto=goto, update={"next": goto})
+    # 기분/건강 관련 키워드 체크
+    mood_keywords = ["기분", "좋음", "나쁨", "평범", "건강", "컨디션", "몸"]
+    if any(keyword in message for keyword in mood_keywords):
+        matched_keywords = [kw for kw in mood_keywords if kw in message]
+        print(f"기분/건강 키워드 매칭: {matched_keywords}")
+        print(f"라우팅: mood_health_agent")
+        return Command(
+            goto="mood_health_agent", 
+            update={
+                "selected_agent": "mood_health_agent",
+                "service_type": "mood_health"
+            }
+        )
+    
+    # 치매 관련 키워드 체크 (기본값)
+    dementia_keywords = ["기억", "잊어", "날짜", "시간", "혼란", "반복"]
+    if any(keyword in message for keyword in dementia_keywords):
+        matched_keywords = [kw for kw in dementia_keywords if kw in message]
+        print(f"치매 키워드 매칭: {matched_keywords}")
+        print(f"라우팅: dementia_agent")
+        return Command(
+            goto="dementia_agent", 
+            update={
+                "selected_agent": "dementia_agent",
+                "service_type": "dementia"
+            }
+        )
+    
+    # 기본값: 치매 검사
+    print(f"기본 라우팅: dementia_agent")
+    return Command(
+        goto="dementia_agent", 
+        update={
+            "selected_agent": "dementia_agent",
+            "service_type": "dementia"
+        }
+    )
 
-# 치매 검사 Agent 노드
+# 치매 검사 Agent 노드 - 실행 후 바로 종료
 def dementia_node(state: State) -> Command[Literal["__end__"]]:
-    """치매 검사 서비스를 처리하는 노드"""
+    """치매 검사 서비스 - 실행 후 바로 종료"""
+    print(f"\n=== DEMENTIA NODE 실행 ===")
+    print(f"State 정보: selected_agent={state.get('selected_agent')}, service_type={state.get('service_type')}")
+    
     try:
         patient_id = state.get("patient_id", "patient_001")
         conversation_text = state["messages"][-1].content
         audio_file_path = state.get("audio_file_path")
+        
+        print(f"환자 ID: {patient_id}")
+        print(f"대화 내용: {conversation_text}")
+        print(f"음성 파일: {audio_file_path}")
         
         # 대화 처리
         conversation_result = process_conversation(patient_id, conversation_text)
@@ -653,6 +686,10 @@ def dementia_node(state: State) -> Command[Literal["__end__"]]:
         final_diagnosis = "yes" if dementia_indicators >= 2 else "no"
         avg_confidence = float(total_confidence / len(check_results)) if check_results else 0.0
         
+        print(f"치매 의심 지표: {dementia_indicators}/4")
+        print(f"평균 신뢰도: {avg_confidence:.3f}")
+        print(f"최종 진단: {final_diagnosis}")
+        
         dementia_result = {
             "diagnosis": final_diagnosis,
             "confidence": avg_confidence,
@@ -662,6 +699,7 @@ def dementia_node(state: State) -> Command[Literal["__end__"]]:
             "audio_used": audio_file_path is not None
         }
         
+        print(f"치매 검사 완료 - END로 종료")
         return Command(
             update={
                 "messages": [
@@ -672,10 +710,11 @@ def dementia_node(state: State) -> Command[Literal["__end__"]]:
                 ],
                 "dementia_result": dementia_result
             },
-            goto=END
+            goto="__end__"  # 실행 후 바로 종료
         )
         
     except Exception as e:
+        print(f"치매 검사 오류: {str(e)}")
         error_result = {
             "error": f"치매 검사 중 오류: {str(e)}",
             "diagnosis": "no",
@@ -692,21 +731,28 @@ def dementia_node(state: State) -> Command[Literal["__end__"]]:
                 ],
                 "dementia_result": error_result
             },
-            goto=END
+            goto="__end__"  # 오류가 있어도 실행 후 바로 종료
         )
 
-# 복약 알림 Agent 노드
+# 복약 알림 Agent 노드 - 실행 후 바로 종료
 def medicine_node(state: State) -> Command[Literal["__end__"]]:
-    """복약 알림 서비스를 처리하는 노드"""
+    """복약 알림 서비스 - 실행 후 바로 종료"""
+    print(f"\n=== MEDICINE NODE 실행 ===")
+    print(f"State 정보: selected_agent={state.get('selected_agent')}, service_type={state.get('service_type')}")
+    
     try:
         message = state["messages"][-1].content
+        print(f"입력 메시지: {message}")
         
         # 복약 정보 분석
         medicine_info = analyze_medicine(message)
+        print(f"복약 정보 분석 결과: {medicine_info}")
         
         # 응답 생성
         medicine_result = generate_medicine_response(medicine_info)
+        print(f"복약 응답 생성: {medicine_result}")
         
+        print(f"복약 분석 완료 - END로 종료")
         return Command(
             update={
                 "messages": [
@@ -717,10 +763,11 @@ def medicine_node(state: State) -> Command[Literal["__end__"]]:
                 ],
                 "medicine_result": medicine_result
             },
-            goto=END
+            goto="__end__"  # 실행 후 바로 종료
         )
         
     except Exception as e:
+        print(f"복약 분석 오류: {str(e)}")
         error_result = {
             "error": f"복약 분석 중 오류: {str(e)}",
             "time": "",
@@ -739,21 +786,28 @@ def medicine_node(state: State) -> Command[Literal["__end__"]]:
                 ],
                 "medicine_result": error_result
             },
-            goto=END
+            goto="__end__"  # 오류가 있어도 실행 후 바로 종료
         )
 
-# 기분 및 건강체크 Agent 노드
+# 기분 및 건강체크 Agent 노드 - 실행 후 바로 종료
 def mood_health_node(state: State) -> Command[Literal["__end__"]]:
-    """기분 및 건강체크 서비스를 처리하는 노드"""
+    """기분 및 건강체크 서비스 - 실행 후 바로 종료"""
+    print(f"\n=== MOOD_HEALTH NODE 실행 ===")
+    print(f"State 정보: selected_agent={state.get('selected_agent')}, service_type={state.get('service_type')}")
+    
     try:
         message = state["messages"][-1].content
+        print(f"입력 메시지: {message}")
         
         # 기분 및 건강 상태 분석
         mood_health_info = analyze_mood_health(message)
+        print(f"기분/건강 분석 결과: {mood_health_info}")
         
         # 응답 생성
         mood_health_result = generate_mood_health_response(mood_health_info)
+        print(f"기분/건강 응답 생성: {mood_health_result}")
         
+        print(f"기분/건강체크 완료 - END로 종료")
         return Command(
             update={
                 "messages": [
@@ -771,10 +825,11 @@ def mood_health_node(state: State) -> Command[Literal["__end__"]]:
                     "confidence": mood_health_result["confidence"]
                 }
             },
-            goto=END
+            goto="__end__"  # 실행 후 바로 종료
         )
         
     except Exception as e:
+        print(f"기분/건강체크 오류: {str(e)}")
         error_result = {
             "error": f"기분 및 건강체크 분석 중 오류: {str(e)}",
             "mood": "평범",
@@ -792,13 +847,13 @@ def mood_health_node(state: State) -> Command[Literal["__end__"]]:
                 "mood_result": {"mood": "평범", "confidence": 0.0},
                 "health_result": {"status": "분석 오류", "confidence": 0.0}
             },
-            goto=END
+            goto="__end__"  # 오류가 있어도 실행 후 바로 종료
         )
 
 # ==================== LangGraph 그래프 구성 ====================
 
 def create_supervisor_graph():
-    """Supervisor 그래프 생성"""
+    """Supervisor 그래프 생성 - 단순한 구조"""
     graph_builder = StateGraph(State)
     
     # 노드 추가
@@ -807,22 +862,20 @@ def create_supervisor_graph():
     graph_builder.add_node("medicine_agent", medicine_node)
     graph_builder.add_node("mood_health_agent", mood_health_node)
     
-    # 엣지 추가
-    graph_builder.add_edge(START, "supervisor")
+    # 엣지 추가 - 단순한 구조
     graph_builder.add_edge("supervisor", "dementia_agent")
     graph_builder.add_edge("supervisor", "medicine_agent")
     graph_builder.add_edge("supervisor", "mood_health_agent")
-    graph_builder.add_edge("supervisor", END)
     
-    # 모든 agent는 END로 직접 이동
-    graph_builder.add_edge("dementia_agent", END)
-    graph_builder.add_edge("medicine_agent", END)
-    graph_builder.add_edge("mood_health_agent", END)
+    # 각 Agent에서 END로
+    graph_builder.add_edge("dementia_agent", "__end__")
+    graph_builder.add_edge("medicine_agent", "__end__")
+    graph_builder.add_edge("mood_health_agent", "__end__")
     
-    # 메모리 설정
-    memory = MemorySaver()
-    graph = graph_builder.compile(checkpointer=memory)
-    return graph
+    # 시작점 설정
+    graph_builder.set_entry_point("supervisor")
+    
+    return graph_builder.compile()
 
 # 그래프 인스턴스 생성
 supervisor_graph = create_supervisor_graph()
@@ -875,6 +928,11 @@ async def supervisor_endpoint(
     
     사용자 메시지를 분석하여 적절한 의료 서비스로 라우팅합니다.
     """
+    print(f"\n=== SUPERVISOR ENDPOINT 호출 ===")
+    print(f"메시지: {message}")
+    print(f"환자 ID: {patient_id}")
+    print(f"음성 파일: {audio_file.filename if audio_file else 'None'}")
+    
     try:
         config = {"configurable": {"thread_id": f"supervisor_{patient_id or 'default'}"}}
         
@@ -888,6 +946,7 @@ async def supervisor_endpoint(
             with open(temp_file.name, "wb") as buffer:
                 shutil.copyfileobj(audio_file.file, buffer)
             audio_file_path = temp_file.name
+            print(f"음성 파일 저장됨: {audio_file_path}")
         
         # 입력 메시지 준비
         input_data = {
@@ -901,23 +960,41 @@ async def supervisor_endpoint(
             "audio_file_path": audio_file_path
         }
         
+        print(f"그래프 입력 데이터: {input_data}")
+        
         # 그래프 실행
         response = await supervisor_graph.ainvoke(input_data, config=config)
         
-        # 결과 분석 - service_type을 결과에서 추론
-        service_type = "unknown"
-        result_data = {}
+        print(f"그래프 실행 결과: {response}")
         
-        if response.get("dementia_result"):
-            service_type = "dementia"
+        # 결과 분석 - State 전체를 응답으로 사용
+        selected_agent = response.get("selected_agent", "unknown")
+        service_type = response.get("service_type", "unknown")
+        
+        print(f"선택된 Agent: {selected_agent}")
+        print(f"서비스 타입: {service_type}")
+        
+        # State를 dict로 변환 (JSON 직렬화 가능하도록)
+        state_dict = {
+            "selected_agent": response.get("selected_agent"),
+            "service_type": response.get("service_type"),
+            "patient_id": response.get("patient_id"),
+            "audio_file_path": response.get("audio_file_path"),
+            "dementia_result": response.get("dementia_result"),
+            "medicine_result": response.get("medicine_result"),
+            "mood_result": response.get("mood_result"),
+            "health_result": response.get("health_result"),
+            "messages": [msg.dict() if hasattr(msg, 'dict') else msg for msg in response.get("messages", [])]
+        }
+        
+        # 주요 응답 데이터 추출
+        if selected_agent == "dementia_agent":
             result_data = response.get("dementia_result", {})
             next_action = "치매 검사 완료 - 추가 상담이 필요할 수 있습니다."
-        elif response.get("medicine_result"):
-            service_type = "medicine"
+        elif selected_agent == "medicine_agent":
             result_data = response.get("medicine_result", {})
             next_action = "복약 정보 추출 완료 - 알림 설정이 필요할 수 있습니다."
-        elif response.get("mood_result") or response.get("health_result"):
-            service_type = "mood_health"
+        elif selected_agent == "mood_health_agent":
             result_data = {
                 "mood": response.get("mood_result", {}),
                 "health": response.get("health_result", {})
@@ -927,17 +1004,23 @@ async def supervisor_endpoint(
             result_data = {"message": "서비스 타입을 결정할 수 없습니다."}
             next_action = "수동 확인이 필요합니다."
         
+        print(f"최종 응답 데이터: {result_data}")
+        
         # 임시 파일 정리
         if temp_file and os.path.exists(temp_file.name):
             os.unlink(temp_file.name)
+            print(f"임시 파일 삭제됨: {temp_file.name}")
         
         return SupervisorResponse(
             service_type=service_type,
+            selected_agent=selected_agent,
+            state=state_dict,
             response=result_data,
             next_action=next_action
         )
         
     except Exception as e:
+        print(f"Supervisor 엔드포인트 오류: {str(e)}")
         # 임시 파일 정리
         if temp_file and os.path.exists(temp_file.name):
             os.unlink(temp_file.name)
@@ -971,19 +1054,30 @@ async def supervisor_json_endpoint(request: SupervisorRequest):
         response = await supervisor_graph.ainvoke(input_data, config=config)
         
         # 결과 분석
-        service_type = "unknown"
-        result_data = {}
+        selected_agent = response.get("selected_agent", "unknown")
+        service_type = response.get("service_type", "unknown")
         
-        if response.get("dementia_result"):
-            service_type = "dementia"
+        # State를 dict로 변환
+        state_dict = {
+            "selected_agent": response.get("selected_agent"),
+            "service_type": response.get("service_type"),
+            "patient_id": response.get("patient_id"),
+            "audio_file_path": response.get("audio_file_path"),
+            "dementia_result": response.get("dementia_result"),
+            "medicine_result": response.get("medicine_result"),
+            "mood_result": response.get("mood_result"),
+            "health_result": response.get("health_result"),
+            "messages": [msg.dict() if hasattr(msg, 'dict') else msg for msg in response.get("messages", [])]
+        }
+        
+        # 주요 응답 데이터 추출
+        if selected_agent == "dementia_agent":
             result_data = response.get("dementia_result", {})
             next_action = "치매 검사 완료 - 추가 상담이 필요할 수 있습니다."
-        elif response.get("medicine_result"):
-            service_type = "medicine"
+        elif selected_agent == "medicine_agent":
             result_data = response.get("medicine_result", {})
             next_action = "복약 정보 추출 완료 - 알림 설정이 필요할 수 있습니다."
-        elif response.get("mood_result") or response.get("health_result"):
-            service_type = "mood_health"
+        elif selected_agent == "mood_health_agent":
             result_data = {
                 "mood": response.get("mood_result", {}),
                 "health": response.get("health_result", {})
@@ -995,6 +1089,8 @@ async def supervisor_json_endpoint(request: SupervisorRequest):
         
         return SupervisorResponse(
             service_type=service_type,
+            selected_agent=selected_agent,
+            state=state_dict,
             response=result_data,
             next_action=next_action
         )
