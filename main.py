@@ -37,6 +37,7 @@ class SummarizeRequest(BaseModel):
 # 응답 모델
 class SummarizeResponse(BaseModel):
     summary: str
+    dementia_suspicion: bool
     original_length: int
     summary_length: int
     compression_ratio: float
@@ -69,6 +70,56 @@ def split_text_into_chunks(text: str, chunk_size: int = 2000, chunk_overlap: int
     
     return text_splitter.split_text(text)
 
+def analyze_dementia_suspicion(text: str, model) -> bool:
+    """
+    텍스트를 분석하여 치매 의심 여부를 판단합니다.
+    """
+    prompt = f"""
+    당신은 치매 전문의입니다. 주어진 텍스트를 분석하여 치매 의심 증상이 있는지 판단해주세요.
+    
+    치매 의심 증상:
+    - 기억력 저하 (최근 일 기억 못함, 반복적인 질문)
+    - 언어 능력 저하 (단어 찾기 어려움, 문장 구성 어려움)
+    - 시공간 능력 저하 (길 찾기 어려움, 시간 개념 혼란)
+    - 판단력 저하 (부적절한 행동, 의사결정 어려움)
+    - 성격 변화 (과민, 우울, 무관심)
+    - 일상생활 수행 능력 저하
+    
+    텍스트:
+    {text}
+    
+    위 증상들이 명확하게 나타나는지 분석하고, JSON 형식으로 응답해주세요:
+    {{"dementia_suspicion": true/false, "reason": "판단 근거"}}
+    """
+    
+    try:
+        response = model.generate_content(prompt)
+        response_text = response.text
+        
+        # JSON 파싱
+        if "```json" in response_text:
+            start = response_text.find("```json") + 7
+            end = response_text.find("```", start)
+            if end != -1:
+                json_text = response_text[start:end].strip()
+            else:
+                json_text = response_text.strip()
+        else:
+            json_text = response_text.strip()
+        
+        # JSON 부분 추출
+        start = json_text.find("{")
+        end = json_text.rfind("}") + 1
+        if start != -1 and end != 0:
+            json_text = json_text[start:end]
+        
+        data = json.loads(json_text)
+        return data.get("dementia_suspicion", False)
+        
+    except Exception as e:
+        print(f"치매 의심 분석 중 오류: {e}")
+        return False
+
 def map_reduce_summarize(text: str, model, max_length: Optional[int] = None) -> str:
     """
     Map-Reduce 방식을 사용하여 텍스트를 요약합니다.
@@ -81,6 +132,7 @@ def map_reduce_summarize(text: str, model, max_length: Optional[int] = None) -> 
         prompt = f"""
         당신은 전문적인 텍스트 요약 전문가입니다. 
         주어진 텍스트를 한국어로 간결하고 정확하게 요약해주세요.
+        요약은 반드시 2줄 이내로 작성해주세요.
         
         텍스트:
         {text}
@@ -96,6 +148,7 @@ def map_reduce_summarize(text: str, model, max_length: Optional[int] = None) -> 
             map_prompt = f"""
             당신은 텍스트 요약 전문가입니다. 
             주어진 텍스트 부분을 한국어로 간결하게 요약해주세요.
+            요약은 1줄 이내로 작성해주세요.
             
             텍스트 부분:
             {chunk}
@@ -111,6 +164,7 @@ def map_reduce_summarize(text: str, model, max_length: Optional[int] = None) -> 
         당신은 텍스트 요약 전문가입니다. 
         여러 개의 요약을 하나의 통합된 요약으로 만들어주세요. 
         중복된 내용은 제거하고 핵심 내용만 포함해주세요.
+        최종 요약은 반드시 2줄 이내로 작성해주세요.
         
         요약들:
         {combined_text}
@@ -120,11 +174,17 @@ def map_reduce_summarize(text: str, model, max_length: Optional[int] = None) -> 
         response = model.generate_content(reduce_prompt)
         summary = response.text
     
+    # 요약을 2줄로 제한
+    lines = summary.strip().split('\n')
+    if len(lines) > 2:
+        summary = '\n'.join(lines[:2])
+    
     # 요약 길이 제한
     if max_length and len(summary) > max_length:
         short_prompt = f"""
         당신은 텍스트 요약 전문가입니다. 
         주어진 텍스트를 {max_length}자 이내로 한국어로 간결하게 요약해주세요.
+        요약은 반드시 2줄 이내로 작성해주세요.
         
         텍스트:
         {summary}
@@ -133,6 +193,10 @@ def map_reduce_summarize(text: str, model, max_length: Optional[int] = None) -> 
         """
         response = model.generate_content(short_prompt)
         summary = response.text
+        # 다시 2줄로 제한
+        lines = summary.strip().split('\n')
+        if len(lines) > 2:
+            summary = '\n'.join(lines[:2])
     
     return summary
 
@@ -210,7 +274,7 @@ async def health_check():
 @app.post("/summarize", response_model=SummarizeResponse)
 async def summarize_text(request: SummarizeRequest):
     """
-    Map-Reduce 방식을 사용하여 텍스트를 요약합니다.
+    Map-Reduce 방식을 사용하여 텍스트를 요약하고 치매 의심 여부를 분석합니다.
     """
     try:
         # Google API 키 확인
@@ -236,11 +300,15 @@ async def summarize_text(request: SummarizeRequest):
         # Map-Reduce 요약 실행
         summary = map_reduce_summarize(request.text, model, request.max_length)
         
+        # 치매 의심 여부 분석
+        dementia_suspicion = analyze_dementia_suspicion(request.text, model)
+        
         summary_length = len(summary)
         compression_ratio = (1 - summary_length / original_length) * 100 if original_length > 0 else 0
         
         return SummarizeResponse(
             summary=summary,
+            dementia_suspicion=dementia_suspicion,
             original_length=original_length,
             summary_length=summary_length,
             compression_ratio=round(compression_ratio, 2),
