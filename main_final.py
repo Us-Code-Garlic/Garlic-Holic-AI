@@ -2,12 +2,14 @@ import os
 import json
 from typing import Literal, TypedDict, Optional
 from fastapi import FastAPI, HTTPException, File, UploadFile, Form
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage, AIMessage
 from langgraph.graph import StateGraph, MessagesState, START, END
 from langgraph.types import Command
 from langgraph.checkpoint.memory import MemorySaver
+from langchain_core.prompts import ChatPromptTemplate
 from dotenv import load_dotenv
 import asyncio
 import tempfile
@@ -18,21 +20,35 @@ from datetime import datetime
 import librosa
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
+import google.generativeai as genai
+import google.genai as genai_client
+from google.genai import types
 
 # 환경 변수 로드
 load_dotenv()
 
 # FastAPI 앱 초기화
 app = FastAPI(
-    title="의료 서비스 Supervisor Agent",
-    description="치매 검사와 복약 알림을 통합 관리하는 Supervisor Agent",
-    version="1.0.0"
+    title="통합 의료 서비스 API",
+    description="치매 검사, 복약 알림, 기분 및 건강체크를 통합 관리하는 API 서버",
+    version="2.0.0"
+)
+
+# CORS 설정
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # LLM 초기화
 llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash")
 
-# Pydantic 모델 정의
+# ==================== Pydantic 모델 정의 ====================
+
+# Supervisor 관련 모델
 class SupervisorRequest(BaseModel):
     message: str = Field(..., description="사용자 메시지")
     patient_id: Optional[str] = Field(None, description="환자 ID (치매 검사용)")
@@ -42,18 +58,33 @@ class SupervisorResponse(BaseModel):
     response: dict = Field(..., description="응답 내용")
     next_action: str = Field(..., description="다음 액션")
 
-# State 정의
+# 복약 관련 모델
+class MedicineInfo(BaseModel):
+    """복약 정보를 추출하는 모델"""
+    time: str = Field(description="복약 시간을 24시간 형식으로 변환 (예: 08:00, 20:30)")
+    medicine_name: str = Field(description="약물 이름")
+    dosage: str = Field(description="복용량 (예: 2개, 1정, 10ml)")
+    needs_reminder: bool = Field(description="복약알림이 필요한지 여부")
+
+# 기분 및 건강 관련 모델
+class MoodHealthInfo(BaseModel):
+    """기분 및 건강 정보를 추출하는 모델"""
+    mood: Literal["좋음", "나쁨", "평범"] = Field(description="기분 상태 (반드시 3개 중 하나)")
+    health_status: str = Field(description="건강 상태에 대한 자유로운 텍스트 설명")
+    confidence: float = Field(description="분석 신뢰도 (0.0-1.0)")
+
+# ==================== State 및 Router 정의 ====================
+
 class State(MessagesState):
     next: str = "supervisor"
     service_type: Optional[str] = None
     patient_id: Optional[str] = None
-    audio_file_path: Optional[str] = None  # 음성 파일 경로 추가
+    audio_file_path: Optional[str] = None
     dementia_result: Optional[dict] = None
     medicine_result: Optional[dict] = None
-    mood_result: Optional[dict] = None  # 기분 결과 추가
-    health_result: Optional[dict] = None  # 건강체크 결과 추가
+    mood_result: Optional[dict] = None
+    health_result: Optional[dict] = None
 
-# Router 정의
 members = ["dementia_agent", "medicine_agent", "mood_health_agent"]
 options = members + ["FINISH"]
 
@@ -61,49 +92,8 @@ class Router(TypedDict):
     """Worker to route to next. If no workers needed, route to FINISH."""
     next: Literal[*options]
 
-# Supervisor 노드
-system_prompt = f"""
-당신은 의료 서비스를 관리하는 Supervisor Agent입니다.
-다음 세 가지 서비스를 관리합니다:
+# ==================== 음성 분석 함수들 ====================
 
-1. dementia_agent: 치매 검사 서비스
-   - 환자의 대화나 음성을 분석하여 치매 의심 여부를 검사
-   - 발음 어눌함, 기억력 저하, 반복 발화 등을 분석
-   - 사용 예시: "아침에 약을 먹었는데 또 먹어야 하나요?", "오늘 날짜가 뭐였지?"
-
-2. medicine_agent: 복약 알림 서비스
-   - 복약 관련 메시지를 분석하여 복용 시간, 약물명, 복용량 추출
-   - 복약 알림 설정 및 관리
-   - 사용 예시: "아침 8시에 혈압약 1정 먹어야 해", "관절염 약 2개씩 복용"
-
-3. mood_health_agent: 기분 및 건강체크 서비스
-   - 환자의 기분 상태를 "좋음", "나쁨", "평범" 중 하나로 판별
-   - 전반적인 건강 상태를 텍스트로 분석
-   - 사용 예시: "오늘 기분이 좋아요", "몸이 좀 아파요", "컨디션이 평범해요"
-
-사용자의 메시지를 분석하여 적절한 서비스로 라우팅하세요:
-- 치매 관련 증상이나 인지 기능 문제 → dementia_agent
-- 복약 관련 정보나 알림 설정 → medicine_agent
-- 기분이나 건강 상태 관련 → mood_health_agent
-- 두 서비스 이상 필요하거나 명확하지 않으면 → mood_health_agent (일반적인 대화 우선)
-
-작업이 완료되면 FINISH로 응답하세요.
-"""
-
-def supervisor_node(state: State) -> Command[Literal[*members, "__end__"]]:
-    messages = [
-        {"role": "system", "content": system_prompt},
-    ] + state["messages"]
-    
-    response = llm.with_structured_output(Router).invoke(messages)
-    goto = response["next"]
-    
-    if goto == "FINISH":
-        goto = END
-    
-    return Command(goto=goto, update={"next": goto})
-
-# 음성 분석 함수 추가
 def analyze_audio_pronunciation(audio_file_path: str):
     """음성 파일을 분석하여 발음 어눌함을 검사하는 함수"""
     try:
@@ -111,24 +101,21 @@ def analyze_audio_pronunciation(audio_file_path: str):
         y, sr = librosa.load(audio_file_path, sr=None)
         
         # 기본적인 음성 특성 분석
-        # 1. 음성 길이
-        duration = float(len(y) / sr)  # numpy.float32를 float로 변환
+        duration = float(len(y) / sr)
+        energy = float(np.mean(librosa.feature.rms(y=y)))
         
-        # 2. 음성 에너지 (볼륨)
-        energy = float(np.mean(librosa.feature.rms(y=y)))  # numpy.float32를 float로 변환
-        
-        # 3. 음성 스펙트럼 특성
+        # 음성 스펙트럼 특성
         mfccs = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
         mfcc_mean = np.mean(mfccs, axis=1)
         mfcc_std = np.std(mfccs, axis=1)
         
-        # 4. 음성 명확도 (스펙트럼 중심)
+        # 음성 명확도 (스펙트럼 중심)
         spectral_centroids = librosa.feature.spectral_centroid(y=y, sr=sr)[0]
-        spectral_centroid_mean = float(np.mean(spectral_centroids))  # numpy.float32를 float로 변환
+        spectral_centroid_mean = float(np.mean(spectral_centroids))
         
-        # 5. 음성 대비 (스펙트럼 대비)
+        # 음성 대비 (스펙트럼 대비)
         spectral_contrast = librosa.feature.spectral_contrast(y=y, sr=sr)
-        spectral_contrast_mean = float(np.mean(spectral_contrast))  # numpy.float32를 float로 변환
+        spectral_contrast_mean = float(np.mean(spectral_contrast))
         
         # 발음 어눌함 판단 기준
         pronunciation_score = 0.0
@@ -157,10 +144,10 @@ def analyze_audio_pronunciation(audio_file_path: str):
         # 결과 결정
         if pronunciation_score >= 0.5:
             result = "unclear"
-            confidence = float(min(pronunciation_score, 0.9))  # numpy.float32를 float로 변환
+            confidence = float(min(pronunciation_score, 0.9))
         else:
             result = "clear"
-            confidence = float(1.0 - pronunciation_score)  # numpy.float32를 float로 변환
+            confidence = float(1.0 - pronunciation_score)
         
         return {
             "type": "audio_pronunciation_analysis",
@@ -184,7 +171,8 @@ def analyze_audio_pronunciation(audio_file_path: str):
             "audio_features": {}
         }
 
-# 치매 검사 함수들 (fastapi_dementia_check.py에서 가져옴)
+# ==================== 치매 검사 함수들 ====================
+
 def process_conversation(patient_id: str, conversation_text: str):
     """사용자 대화를 처리하고 LLM 응답을 생성하는 함수"""
     conversation_prompt = f"""
@@ -299,7 +287,7 @@ def check_pronunciation_clarity(conversation_text: str, audio_file_path: Optiona
         results.append({
             "type": "text_pronunciation_analysis",
             "result": pronunciation_status,
-            "confidence": float(confidence),  # numpy 타입 방지
+            "confidence": float(confidence),
             "details": details
         })
         
@@ -326,7 +314,7 @@ def check_pronunciation_clarity(conversation_text: str, audio_file_path: Optiona
         audio_weight = 0.6
         
         combined_confidence = float(text_result["confidence"] * text_weight + 
-                                   audio_result["confidence"] * audio_weight)  # numpy 타입 방지
+                                   audio_result["confidence"] * audio_weight)
         
         # 둘 중 하나라도 unclear이면 unclear로 판정
         if text_result["result"] == "unclear" or audio_result["result"] == "unclear":
@@ -459,16 +447,7 @@ def check_repetitive_speech(conversation_text: str):
             "details": f"반복 발화 검사 오류: {str(e)}"
         }
 
-# 복약 분석 함수들 (fastapi_medicine_check.py에서 가져옴)
-from langchain_core.prompts import ChatPromptTemplate
-from pydantic import BaseModel as PydanticBaseModel
-
-class MedicineInfo(PydanticBaseModel):
-    """복약 정보를 추출하는 모델"""
-    time: str = Field(description="복약 시간을 24시간 형식으로 변환 (예: 08:00, 20:30)")
-    medicine_name: str = Field(description="약물 이름")
-    dosage: str = Field(description="복용량 (예: 2개, 1정, 10ml)")
-    needs_reminder: bool = Field(description="복약알림이 필요한지 여부")
+# ==================== 복약 분석 함수들 ====================
 
 def analyze_medicine(message: str):
     """복약 정보를 분석하는 함수"""
@@ -530,6 +509,111 @@ def generate_medicine_response(medicine_info: MedicineInfo):
         "dosage": dosage,
         "needs_reminder": needs_reminder
     }
+
+# ==================== 기분 및 건강체크 함수들 ====================
+
+def analyze_mood_health(message: str):
+    """기분 및 건강 상태를 분석하는 함수"""
+    analysis_msgs = [
+        ("system", """
+        당신은 환자의 기분과 건강 상태를 분석하는 전문가입니다.
+        사용자의 메시지에서 다음 정보를 정확히 추출해주세요:
+
+        1. 기분 상태: 반드시 "좋음", "나쁨", "평범" 중 하나로 판별
+           - "좋음": 긍정적이고 기분이 좋은 상태
+           - "나쁨": 부정적이고 기분이 나쁜 상태  
+           - "평범": 특별히 좋지도 나쁘지도 않은 보통 상태
+
+        2. 건강 상태: 전반적인 건강 상태를 자유로운 텍스트로 설명
+           - 신체적 증상, 컨디션, 불편함 등을 포함
+           - 구체적이고 이해하기 쉽게 작성
+
+        3. 신뢰도: 분석의 확신 정도 (0.0-1.0)
+
+        예시:
+        - "오늘 기분이 정말 좋아요" → mood: "좋음", health_status: "전반적으로 건강하고 기분이 좋은 상태"
+        - "몸이 좀 아파요" → mood: "나쁨", health_status: "신체적 불편함이 있어 건강 상태가 좋지 않음"
+        - "컨디션이 평범해요" → mood: "평범", health_status: "특별한 문제없이 평상시와 같은 건강 상태"
+        """),
+        ("user", f"사용자 메시지: {message}\n기분과 건강 상태를 분석해주세요:"),
+    ]
+    analysis_prompt = ChatPromptTemplate.from_messages(analysis_msgs)
+    
+    model_with_structured_output = llm.with_structured_output(MoodHealthInfo)
+    
+    response = model_with_structured_output.invoke(
+        analysis_prompt.format_messages(
+            messages=message
+        )
+    )
+    
+    return response
+
+def generate_mood_health_response(mood_health_info: MoodHealthInfo):
+    """기분 및 건강 응답을 생성하는 함수"""
+    mood = mood_health_info.mood
+    health_status = mood_health_info.health_status
+    confidence = mood_health_info.confidence
+    
+    # 기분에 따른 응답 메시지 생성
+    mood_responses = {
+        "좋음": "기분이 좋으시다니 다행이에요! 좋은 기분을 유지하세요.",
+        "나쁨": "기분이 좋지 않으시군요. 무리하지 마시고 충분히 휴식을 취하세요.",
+        "평범": "평범한 기분이시군요. 괜찮으시면 좋겠어요."
+    }
+    
+    response_message = mood_responses.get(mood, "기분 상태를 확인했습니다.")
+    
+    return {
+        "mood": mood,
+        "health_status": health_status,
+        "confidence": confidence,
+        "response_message": response_message
+    }
+
+# ==================== LangGraph 노드들 ====================
+
+# Supervisor 노드
+system_prompt = f"""
+당신은 의료 서비스를 관리하는 Supervisor Agent입니다.
+다음 세 가지 서비스를 관리합니다:
+
+1. dementia_agent: 치매 검사 서비스
+   - 환자의 대화나 음성을 분석하여 치매 의심 여부를 검사
+   - 발음 어눌함, 기억력 저하, 반복 발화 등을 분석
+   - 사용 예시: "아침에 약을 먹었는데 또 먹어야 하나요?", "오늘 날짜가 뭐였지?"
+
+2. medicine_agent: 복약 알림 서비스
+   - 복약 관련 메시지를 분석하여 복용 시간, 약물명, 복용량 추출
+   - 복약 알림 설정 및 관리
+   - 사용 예시: "아침 8시에 혈압약 1정 먹어야 해", "관절염 약 2개씩 복용"
+
+3. mood_health_agent: 기분 및 건강체크 서비스
+   - 환자의 기분 상태를 "좋음", "나쁨", "평범" 중 하나로 판별
+   - 전반적인 건강 상태를 텍스트로 분석
+   - 사용 예시: "오늘 기분이 좋아요", "몸이 좀 아파요", "컨디션이 평범해요"
+
+사용자의 메시지를 분석하여 적절한 서비스로 라우팅하세요:
+- 치매 관련 증상이나 인지 기능 문제 → dementia_agent
+- 복약 관련 정보나 알림 설정 → medicine_agent
+- 기분이나 건강 상태 관련 → mood_health_agent
+- 두 서비스 이상 필요하거나 명확하지 않으면 → mood_health_agent (일반적인 대화 우선)
+
+작업이 완료되면 FINISH로 응답하세요.
+"""
+
+def supervisor_node(state: State) -> Command[Literal[*members, "__end__"]]:
+    messages = [
+        {"role": "system", "content": system_prompt},
+    ] + state["messages"]
+    
+    response = llm.with_structured_output(Router).invoke(messages)
+    goto = response["next"]
+    
+    if goto == "FINISH":
+        goto = END
+    
+    return Command(goto=goto, update={"next": goto})
 
 # 치매 검사 Agent 노드
 def dementia_node(state: State) -> Command[Literal["__end__"]]:
@@ -593,7 +677,7 @@ def dementia_node(state: State) -> Command[Literal["__end__"]]:
                 ],
                 "dementia_result": dementia_result
             },
-            goto=END  # END로 직접 이동
+            goto=END
         )
         
     except Exception as e:
@@ -613,7 +697,7 @@ def dementia_node(state: State) -> Command[Literal["__end__"]]:
                 ],
                 "dementia_result": error_result
             },
-            goto=END  # END로 직접 이동
+            goto=END
         )
 
 # 복약 알림 Agent 노드
@@ -638,7 +722,7 @@ def medicine_node(state: State) -> Command[Literal["__end__"]]:
                 ],
                 "medicine_result": medicine_result
             },
-            goto=END  # END로 직접 이동
+            goto=END
         )
         
     except Exception as e:
@@ -660,74 +744,8 @@ def medicine_node(state: State) -> Command[Literal["__end__"]]:
                 ],
                 "medicine_result": error_result
             },
-            goto=END  # END로 직접 이동
+            goto=END
         )
-
-# 기분 및 건강체크 관련 함수들 추가
-class MoodHealthInfo(PydanticBaseModel):
-    """기분 및 건강 정보를 추출하는 모델"""
-    mood: Literal["좋음", "나쁨", "평범"] = Field(description="기분 상태 (반드시 3개 중 하나)")
-    health_status: str = Field(description="건강 상태에 대한 자유로운 텍스트 설명")
-    confidence: float = Field(description="분석 신뢰도 (0.0-1.0)")
-
-def analyze_mood_health(message: str):
-    """기분 및 건강 상태를 분석하는 함수"""
-    analysis_msgs = [
-        ("system", """
-        당신은 환자의 기분과 건강 상태를 분석하는 전문가입니다.
-        사용자의 메시지에서 다음 정보를 정확히 추출해주세요:
-
-        1. 기분 상태: 반드시 "좋음", "나쁨", "평범" 중 하나로 판별
-           - "좋음": 긍정적이고 기분이 좋은 상태
-           - "나쁨": 부정적이고 기분이 나쁜 상태  
-           - "평범": 특별히 좋지도 나쁘지도 않은 보통 상태
-
-        2. 건강 상태: 전반적인 건강 상태를 자유로운 텍스트로 설명
-           - 신체적 증상, 컨디션, 불편함 등을 포함
-           - 구체적이고 이해하기 쉽게 작성
-
-        3. 신뢰도: 분석의 확신 정도 (0.0-1.0)
-
-        예시:
-        - "오늘 기분이 정말 좋아요" → mood: "좋음", health_status: "전반적으로 건강하고 기분이 좋은 상태"
-        - "몸이 좀 아파요" → mood: "나쁨", health_status: "신체적 불편함이 있어 건강 상태가 좋지 않음"
-        - "컨디션이 평범해요" → mood: "평범", health_status: "특별한 문제없이 평상시와 같은 건강 상태"
-        """),
-        ("user", f"사용자 메시지: {message}\n기분과 건강 상태를 분석해주세요:"),
-    ]
-    analysis_prompt = ChatPromptTemplate.from_messages(analysis_msgs)
-    
-    model_with_structured_output = llm.with_structured_output(MoodHealthInfo)
-    
-    response = model_with_structured_output.invoke(
-        analysis_prompt.format_messages(
-            messages=message
-        )
-    )
-    
-    return response
-
-def generate_mood_health_response(mood_health_info: MoodHealthInfo):
-    """기분 및 건강 응답을 생성하는 함수"""
-    mood = mood_health_info.mood
-    health_status = mood_health_info.health_status
-    confidence = mood_health_info.confidence
-    
-    # 기분에 따른 응답 메시지 생성
-    mood_responses = {
-        "좋음": "기분이 좋으시다니 다행이에요! 좋은 기분을 유지하세요.",
-        "나쁨": "기분이 좋지 않으시군요. 무리하지 마시고 충분히 휴식을 취하세요.",
-        "평범": "평범한 기분이시군요. 괜찮으시면 좋겠어요."
-    }
-    
-    response_message = mood_responses.get(mood, "기분 상태를 확인했습니다.")
-    
-    return {
-        "mood": mood,
-        "health_status": health_status,
-        "confidence": confidence,
-        "response_message": response_message
-    }
 
 # 기분 및 건강체크 Agent 노드
 def mood_health_node(state: State) -> Command[Literal["__end__"]]:
@@ -758,7 +776,7 @@ def mood_health_node(state: State) -> Command[Literal["__end__"]]:
                     "confidence": mood_health_result["confidence"]
                 }
             },
-            goto=END  # END로 직접 이동
+            goto=END
         )
         
     except Exception as e:
@@ -779,10 +797,11 @@ def mood_health_node(state: State) -> Command[Literal["__end__"]]:
                 "mood_result": {"mood": "평범", "confidence": 0.0},
                 "health_result": {"status": "분석 오류", "confidence": 0.0}
             },
-            goto=END  # END로 직접 이동
+            goto=END
         )
 
-# 그래프 구성 수정
+# ==================== LangGraph 그래프 구성 ====================
+
 def create_supervisor_graph():
     """Supervisor 그래프 생성"""
     graph_builder = StateGraph(State)
@@ -791,19 +810,19 @@ def create_supervisor_graph():
     graph_builder.add_node("supervisor", supervisor_node)
     graph_builder.add_node("dementia_agent", dementia_node)
     graph_builder.add_node("medicine_agent", medicine_node)
-    graph_builder.add_node("mood_health_agent", mood_health_node)  # 새로운 노드 추가
+    graph_builder.add_node("mood_health_agent", mood_health_node)
     
     # 엣지 추가
     graph_builder.add_edge(START, "supervisor")
     graph_builder.add_edge("supervisor", "dementia_agent")
     graph_builder.add_edge("supervisor", "medicine_agent")
-    graph_builder.add_edge("supervisor", "mood_health_agent")  # 새로운 엣지 추가
-    graph_builder.add_edge("supervisor", END)  # supervisor → END 직접 연결
+    graph_builder.add_edge("supervisor", "mood_health_agent")
+    graph_builder.add_edge("supervisor", END)
     
     # 모든 agent는 END로 직접 이동
     graph_builder.add_edge("dementia_agent", END)
     graph_builder.add_edge("medicine_agent", END)
-    graph_builder.add_edge("mood_health_agent", END)  # 새로운 엣지 추가
+    graph_builder.add_edge("mood_health_agent", END)
     
     # 메모리 설정
     memory = MemorySaver()
@@ -813,7 +832,43 @@ def create_supervisor_graph():
 # 그래프 인스턴스 생성
 supervisor_graph = create_supervisor_graph()
 
-# FastAPI 엔드포인트 수정
+# ==================== FastAPI 엔드포인트들 ====================
+
+@app.get("/")
+async def root():
+    """루트 엔드포인트"""
+    return {
+        "message": "통합 의료 서비스 API",
+        "version": "2.0.0",
+        "description": "치매 검사, 복약 알림, 기분 및 건강체크를 통합 관리하는 API 서버",
+        "endpoints": {
+            "supervisor": "/supervisor (multipart/form-data with audio)",
+            "supervisor_json": "/supervisor-json (JSON format)",
+            "health": "/health"
+        },
+        "services": {
+            "dementia_check": "치매 검사 서비스 (음성 파일 지원)",
+            "medicine_reminder": "복약 알림 서비스",
+            "mood_health_check": "기분 및 건강체크 서비스"
+        }
+    }
+
+@app.get("/health")
+async def health_check():
+    """헬스 체크 엔드포인트"""
+    return {
+        "status": "healthy", 
+        "service": "통합 의료 서비스 API",
+        "version": "2.0.0",
+        "available_services": [
+            "dementia_check", 
+            "medicine_reminder", 
+            "mood_health_check"
+        ]
+    }
+
+# ==================== Supervisor Agent 엔드포인트 ====================
+
 @app.post("/supervisor", response_model=SupervisorResponse)
 async def supervisor_endpoint(
     message: str = Form(...),
@@ -921,14 +976,24 @@ async def supervisor_json_endpoint(request: SupervisorRequest):
         response = await supervisor_graph.ainvoke(input_data, config=config)
         
         # 결과 분석
-        service_type = response.get("service_type", "unknown")
+        service_type = "unknown"
+        result_data = {}
         
-        if service_type == "dementia":
+        if response.get("dementia_result"):
+            service_type = "dementia"
             result_data = response.get("dementia_result", {})
             next_action = "치매 검사 완료 - 추가 상담이 필요할 수 있습니다."
-        elif service_type == "medicine":
+        elif response.get("medicine_result"):
+            service_type = "medicine"
             result_data = response.get("medicine_result", {})
             next_action = "복약 정보 추출 완료 - 알림 설정이 필요할 수 있습니다."
+        elif response.get("mood_result") or response.get("health_result"):
+            service_type = "mood_health"
+            result_data = {
+                "mood": response.get("mood_result", {}),
+                "health": response.get("health_result", {})
+            }
+            next_action = "기분 및 건강체크 완료 - 필요시 추가 상담을 권장합니다."
         else:
             result_data = {"message": "서비스 타입을 결정할 수 없습니다."}
             next_action = "수동 확인이 필요합니다."
@@ -942,34 +1007,8 @@ async def supervisor_json_endpoint(request: SupervisorRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Supervisor 처리 중 오류가 발생했습니다: {str(e)}")
 
-@app.get("/health")
-async def health_check():
-    """헬스 체크 엔드포인트"""
-    return {
-        "status": "healthy", 
-        "service": "Medical Supervisor Agent",
-        "available_services": ["dementia_check", "medicine_reminder", "mood_health_check"]
-    }
+# ==================== 테스트용 동기 실행 함수 ====================
 
-@app.get("/")
-async def root():
-    """루트 엔드포인트"""
-    return {
-        "message": "의료 서비스 Supervisor Agent",
-        "version": "1.0.0",
-        "endpoints": {
-            "supervisor": "/supervisor (multipart/form-data with audio)",
-            "supervisor_json": "/supervisor-json (JSON format)",
-            "health": "/health"
-        },
-        "services": {
-            "dementia_check": "치매 검사 서비스 (음성 파일 지원)",
-            "medicine_reminder": "복약 알림 서비스",
-            "mood_health_check": "기분 및 건강체크 서비스"
-        }
-    }
-
-# 테스트용 동기 실행 함수
 def run_supervisor_sync(message: str, patient_id: str = "patient_001"):
     """동기적으로 Supervisor Agent 실행 (테스트용)"""
     async def async_run():
@@ -990,13 +1029,26 @@ def run_supervisor_sync(message: str, patient_id: str = "patient_001"):
     
     return asyncio.run(async_run())
 
+# ==================== 메인 실행 ====================
+
 if __name__ == "__main__":
     import uvicorn
     
-    print("=== 의료 서비스 Supervisor Agent 시작 ===")
-    print("Supervisor Agent: http://localhost:8000")
+    print("=== 통합 의료 서비스 API 시작 ===")
+    print("API 서버: http://localhost:8000")
     print()
     
+    print("=== 사용 가능한 서비스 ===")
+    print("1. 치매 검사 서비스 (음성 파일 지원)")
+    print("2. 복약 알림 서비스")
+    print("3. 기분 및 건강체크 서비스")
+    print()
     
-    print("\n=== 서버 시작 ===")
+    print("=== API 엔드포인트 ===")
+    print("- POST /supervisor: Supervisor Agent (음성 파일 지원)")
+    print("- POST /supervisor-json: Supervisor Agent (JSON 형식)")
+    print("- GET /health: 헬스 체크")
+    print()
+    
+    print("=== 서버 시작 ===")
     uvicorn.run(app, host="0.0.0.0", port=8000)
