@@ -31,7 +31,7 @@ app.add_middleware(
 # 요청 모델
 class SummarizeRequest(BaseModel):
     text: str
-    max_length: Optional[int] = 1000
+    max_length: Optional[int] = 800  # 기본값을 800자로 변경
     chunk_size: Optional[int] = 2000
     chunk_overlap: Optional[int] = 200
 
@@ -124,6 +124,7 @@ def analyze_dementia_suspicion(text: str, model) -> bool:
 def map_reduce_summarize(text: str, model, max_length: Optional[int] = None) -> str:
     """
     Map-Reduce 방식을 사용하여 텍스트를 요약합니다.
+    부모님의 관점에서 자식의 상태를 종합적으로 분석합니다.
     """
     # 텍스트를 청크로 분할
     chunks = split_text_into_chunks(text)
@@ -131,73 +132,95 @@ def map_reduce_summarize(text: str, model, max_length: Optional[int] = None) -> 
     if len(chunks) == 1:
         # 단일 청크인 경우 직접 요약
         prompt = f"""
-        당신은 전문적인 텍스트 요약 전문가입니다. 
-        주어진 텍스트를 한국어로 간결하고 정확하게 요약해주세요.
-        요약은 반드시 2줄 이내로 작성해주세요.
+        당신은 치매 전문의이자 노인 의료 전문가입니다. 
+        주어진 텍스트를 분석하여 부모님의 관점에서 자식의 상태를 종합적으로 요약해주세요.
+        
+        다음 항목들을 포함하여 800자 이내로 작성해주세요:
+        1. 치매 의심 여부 및 증상 분석
+        2. 복약 상태 및 약물 복용 여부
+        3. 우울증 증상 및 정신 건강 상태
+        4. 대화 기록을 통한 하루의 일상 생활
+        5. 전반적인 건강 상태 및 주의사항
         
         텍스트:
         {text}
         
-        요약:
+        요약 (부모님 관점에서):
         """
         response = model.generate_content(prompt)
         summary = response.text
     else:
-        # Map 단계: 각 청크를 개별적으로 요약
-        chunk_summaries = []
-        for chunk in chunks:
+        # Map 단계: 각 청크를 개별적으로 분석
+        chunk_analyses = []
+        for i, chunk in enumerate(chunks):
             map_prompt = f"""
-            당신은 텍스트 요약 전문가입니다. 
-            주어진 텍스트 부분을 한국어로 간결하게 요약해주세요.
-            요약은 1줄 이내로 작성해주세요.
+            당신은 치매 전문의입니다. 
+            주어진 텍스트 부분을 분석하여 다음 항목들을 추출해주세요:
+            - 치매 관련 증상
+            - 복약 상태
+            - 우울증 증상
+            - 일상 생활 패턴
+            - 건강 상태
             
-            텍스트 부분:
+            텍스트 부분 {i+1}:
             {chunk}
             
-            요약:
+            분석 결과:
             """
             response = model.generate_content(map_prompt)
-            chunk_summaries.append(response.text)
+            chunk_analyses.append(response.text)
         
-        # Reduce 단계: 모든 요약을 하나로 결합
-        combined_text = "\n\n".join(chunk_summaries)
+        # Reduce 단계: 모든 분석을 하나로 통합
+        combined_text = "\n\n".join(chunk_analyses)
         reduce_prompt = f"""
-        당신은 텍스트 요약 전문가입니다. 
-        여러 개의 요약을 하나의 통합된 요약으로 만들어주세요. 
-        중복된 내용은 제거하고 핵심 내용만 포함해주세요.
-        최종 요약은 반드시 2줄 이내로 작성해주세요.
+        당신은 치매 전문의이자 노인 의료 전문가입니다. 
+        여러 개의 분석 결과를 종합하여 부모님의 관점에서 자식의 상태를 요약해주세요.
         
-        요약들:
+        다음 형식으로 800자 이내로 작성해주세요:
+        
+        [치매 의심 여부]
+        - 증상 분석 및 위험도
+        
+        [복약 상태]
+        - 약물 복용 여부 및 복용 상태
+        
+        [정신 건강]
+        - 우울증 증상 및 정신 상태
+        
+        [일상 생활]
+        - 대화 기록을 통한 하루의 일상 분석
+        
+        [전반적 건강 상태]
+        - 종합적인 건강 상태 및 주의사항
+        
+        분석 결과들:
         {combined_text}
         
-        통합된 요약:
+        종합 요약 (부모님 관점에서):
         """
         response = model.generate_content(reduce_prompt)
         summary = response.text
     
-    # 요약을 2줄로 제한
-    lines = summary.strip().split('\n')
-    if len(lines) > 2:
-        summary = '\n'.join(lines[:2])
-    
-    # 요약 길이 제한
-    if max_length and len(summary) > max_length:
+    # 요약 길이 제한 (800자)
+    max_summary_length = max_length if max_length else 800
+    if len(summary) > max_summary_length:
         short_prompt = f"""
-        당신은 텍스트 요약 전문가입니다. 
-        주어진 텍스트를 {max_length}자 이내로 한국어로 간결하게 요약해주세요.
-        요약은 반드시 2줄 이내로 작성해주세요.
+        당신은 치매 전문의입니다. 
+        주어진 요약을 {max_summary_length}자 이내로 축약하되, 
+        다음 항목들이 모두 포함되도록 해주세요:
+        - 치매 의심 여부
+        - 복약 상태
+        - 우울증 증상
+        - 일상 생활
+        - 전반적 건강 상태
         
-        텍스트:
+        원본 요약:
         {summary}
         
-        요약:
+        축약된 요약 ({max_summary_length}자 이내):
         """
         response = model.generate_content(short_prompt)
         summary = response.text
-        # 다시 2줄로 제한
-        lines = summary.strip().split('\n')
-        if len(lines) > 2:
-            summary = '\n'.join(lines[:2])
     
     return summary
 
