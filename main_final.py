@@ -1,5 +1,6 @@
 import os
 import json
+import uuid
 from typing import Literal, TypedDict, Optional
 from fastapi import FastAPI, HTTPException, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,9 +19,74 @@ import numpy as np
 import soundfile as sf
 from datetime import datetime
 import librosa
+import pymysql
+from contextlib import contextmanager
 
 # 환경 변수 로드
 load_dotenv()
+
+# ==================== DB 연결 설정 ====================
+
+DB_CONFIG = {
+    'host': '14.6.152.212',
+    'user': 'root',
+    'password': 'qlqjstongue@74',
+    'database': 'igarlicyou-dev',
+    'port': 3306,
+    'charset': 'utf8mb4',
+    'autocommit': True
+}
+
+@contextmanager
+def get_db_connection():
+    """DB 연결을 관리하는 컨텍스트 매니저"""
+    connection = None
+    try:
+        connection = pymysql.connect(**DB_CONFIG)
+        yield connection
+    except Exception as e:
+        print(f"DB 연결 오류: {str(e)}")
+        if connection:
+            connection.rollback()
+        raise
+    finally:
+        if connection:
+            connection.close()
+
+def create_chat_table():
+    """채팅 테이블이 없으면 생성하는 함수"""
+    create_table_sql = """
+    CREATE TABLE IF NOT EXISTS chat_history_tb (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        chats TEXT NOT NULL,
+        role ENUM('user', 'agent') NOT NULL,
+        user_id VARCHAR(10) NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    """
+    
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(create_table_sql)
+                print("채팅 테이블 생성 완료 또는 이미 존재함")
+    except Exception as e:
+        print(f"테이블 생성 오류: {str(e)}")
+
+def generate_user_id():
+    """10자리 숫자 user_id 생성"""
+    return str(uuid.uuid4().int)[:10]
+
+def save_chat_to_db(user_id: str, message: str, role: str):
+    """대화 내역을 DB에 저장하는 함수"""
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                sql = "INSERT INTO chat_history_tb (chats, role, user_id) VALUES (%s, %s, %s)"
+                cursor.execute(sql, (message, role, user_id))
+                print(f"DB 저장 완료: user_id={user_id}, role={role}, message={message[:50]}...")
+    except Exception as e:
+        print(f"DB 저장 오류: {str(e)}")
 
 # FastAPI 앱 초기화
 app = FastAPI(
@@ -41,6 +107,12 @@ app.add_middleware(
 # LLM 초기화
 llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash")
 
+# 앱 시작 시 테이블 생성
+@app.on_event("startup")
+async def startup_event():
+    """앱 시작 시 실행되는 이벤트"""
+    create_chat_table()
+
 # ==================== Pydantic 모델 정의 ====================
 
 # Supervisor 관련 모델
@@ -54,6 +126,7 @@ class SupervisorResponse(BaseModel):
     state: dict = Field(..., description="전체 State 정보")
     response: dict = Field(..., description="주요 응답 내용")
     next_action: str = Field(..., description="다음 액션")
+    user_id: str = Field(..., description="사용자 ID")
 
 # 복약 관련 모델
 class MedicineInfo(BaseModel):
@@ -83,6 +156,7 @@ class State(MessagesState):
     medicine_result: Optional[dict] = None
     mood_result: Optional[dict] = None
     health_result: Optional[dict] = None
+    user_id: Optional[str] = None  # 추가: 사용자 ID
 
 members = ["dementia_agent", "medicine_agent", "mood_health_agent"]
 options = members + ["FINISH"]
@@ -580,6 +654,11 @@ def supervisor_node(state: State) -> Command[Literal[*members, "__end__"]]:
     print(f"\n=== SUPERVISOR NODE ===")
     print(f"입력 메시지: {message}")
     
+    # 사용자 입력을 DB에 저장
+    user_id = state.get("user_id")
+    if user_id:
+        save_chat_to_db(user_id, state["messages"][-1].content, "user")
+    
     # 복약 관련 키워드 체크 (최우선)
     medicine_keywords = [
         "약", "복용", "복약", "정", "개", "ml", "시간", 
@@ -646,6 +725,7 @@ def dementia_node(state: State) -> Command[Literal["__end__"]]:
         patient_id = state.get("patient_id", "patient_001")
         conversation_text = state["messages"][-1].content
         audio_file_path = state.get("audio_file_path")
+        user_id = state.get("user_id")
         
         print(f"환자 ID: {patient_id}")
         print(f"대화 내용: {conversation_text}")
@@ -699,6 +779,11 @@ def dementia_node(state: State) -> Command[Literal["__end__"]]:
             "audio_used": audio_file_path is not None
         }
         
+        # Agent 응답을 DB에 저장
+        if user_id:
+            agent_response = f"치매 검사 완료: {final_diagnosis} (신뢰도: {avg_confidence:.3f})"
+            save_chat_to_db(user_id, agent_response, "agent")
+        
         print(f"치매 검사 완료 - END로 종료")
         return Command(
             update={
@@ -721,6 +806,12 @@ def dementia_node(state: State) -> Command[Literal["__end__"]]:
             "confidence": 0.0
         }
         
+        # 오류 응답도 DB에 저장
+        user_id = state.get("user_id")
+        if user_id:
+            error_response = f"치매 검사 오류: {str(e)}"
+            save_chat_to_db(user_id, error_response, "agent")
+        
         return Command(
             update={
                 "messages": [
@@ -742,6 +833,7 @@ def medicine_node(state: State) -> Command[Literal["__end__"]]:
     
     try:
         message = state["messages"][-1].content
+        user_id = state.get("user_id")
         print(f"입력 메시지: {message}")
         
         # 복약 정보 분석
@@ -751,6 +843,11 @@ def medicine_node(state: State) -> Command[Literal["__end__"]]:
         # 응답 생성
         medicine_result = generate_medicine_response(medicine_info)
         print(f"복약 응답 생성: {medicine_result}")
+        
+        # Agent 응답을 DB에 저장
+        if user_id:
+            agent_response = f"복약 정보 추출 완료: {medicine_result['medicine_name']} {medicine_result['dosage']} - {medicine_result['time']}"
+            save_chat_to_db(user_id, agent_response, "agent")
         
         print(f"복약 분석 완료 - END로 종료")
         return Command(
@@ -776,6 +873,12 @@ def medicine_node(state: State) -> Command[Literal["__end__"]]:
             "needs_reminder": False
         }
         
+        # 오류 응답도 DB에 저장
+        user_id = state.get("user_id")
+        if user_id:
+            error_response = f"복약 분석 오류: {str(e)}"
+            save_chat_to_db(user_id, error_response, "agent")
+        
         return Command(
             update={
                 "messages": [
@@ -797,6 +900,7 @@ def mood_health_node(state: State) -> Command[Literal["__end__"]]:
     
     try:
         message = state["messages"][-1].content
+        user_id = state.get("user_id")
         print(f"입력 메시지: {message}")
         
         # 기분 및 건강 상태 분석
@@ -806,6 +910,11 @@ def mood_health_node(state: State) -> Command[Literal["__end__"]]:
         # 응답 생성
         mood_health_result = generate_mood_health_response(mood_health_info)
         print(f"기분/건강 응답 생성: {mood_health_result}")
+        
+        # Agent 응답을 DB에 저장
+        if user_id:
+            agent_response = f"기분 및 건강체크 완료: {mood_health_result['mood']} - {mood_health_result['health_status']}"
+            save_chat_to_db(user_id, agent_response, "agent")
         
         print(f"기분/건강체크 완료 - END로 종료")
         return Command(
@@ -835,6 +944,12 @@ def mood_health_node(state: State) -> Command[Literal["__end__"]]:
             "mood": "평범",
             "health_status": "분석 오류로 인해 확인할 수 없음"
         }
+        
+        # 오류 응답도 DB에 저장
+        user_id = state.get("user_id")
+        if user_id:
+            error_response = f"기분 및 건강체크 오류: {str(e)}"
+            save_chat_to_db(user_id, error_response, "agent")
         
         return Command(
             update={
@@ -934,6 +1049,10 @@ async def supervisor_endpoint(
     print(f"음성 파일: {audio_file.filename if audio_file else 'None'}")
     
     try:
+        # 사용자 ID 생성
+        user_id = generate_user_id()
+        print(f"생성된 사용자 ID: {user_id}")
+        
         config = {"configurable": {"thread_id": f"supervisor_{patient_id or 'default'}"}}
         
         # 음성 파일 처리
@@ -957,7 +1076,8 @@ async def supervisor_endpoint(
                 }
             ],
             "patient_id": patient_id,
-            "audio_file_path": audio_file_path
+            "audio_file_path": audio_file_path,
+            "user_id": user_id  # 사용자 ID 추가
         }
         
         print(f"그래프 입력 데이터: {input_data}")
@@ -1016,7 +1136,8 @@ async def supervisor_endpoint(
             selected_agent=selected_agent,
             state=state_dict,
             response=result_data,
-            next_action=next_action
+            next_action=next_action,
+            user_id=user_id  # 사용자 ID 추가
         )
         
     except Exception as e:
@@ -1036,6 +1157,10 @@ async def supervisor_json_endpoint(request: SupervisorRequest):
     기존 JSON 형식 호환성을 위한 엔드포인트
     """
     try:
+        # 사용자 ID 생성
+        user_id = generate_user_id()
+        print(f"생성된 사용자 ID: {user_id}")
+        
         config = {"configurable": {"thread_id": f"supervisor_{request.patient_id or 'default'}"}}
         
         # 입력 메시지 준비
@@ -1047,7 +1172,8 @@ async def supervisor_json_endpoint(request: SupervisorRequest):
                 }
             ],
             "patient_id": request.patient_id,
-            "audio_file_path": None  # JSON 형식에서는 음성 파일 없음
+            "audio_file_path": None,  # JSON 형식에서는 음성 파일 없음
+            "user_id": user_id  # 사용자 ID 추가
         }
         
         # 그래프 실행
@@ -1092,7 +1218,8 @@ async def supervisor_json_endpoint(request: SupervisorRequest):
             selected_agent=selected_agent,
             state=state_dict,
             response=result_data,
-            next_action=next_action
+            next_action=next_action,
+            user_id=user_id  # 사용자 ID 추가
         )
         
     except Exception as e:
