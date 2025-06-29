@@ -101,7 +101,7 @@ def save_text_to_file(docs, output_file="extracted_text.txt"):
 def main():
     """메인 함수"""
     # PDF 파일 경로
-    pdf_path = "./발표자료_ver1.pdf"
+    pdf_path = "./발표자료_ver4.pdf"
     
     # PDF에서 텍스트 추출
     print("PDF 텍스트 추출을 시작합니다...")
